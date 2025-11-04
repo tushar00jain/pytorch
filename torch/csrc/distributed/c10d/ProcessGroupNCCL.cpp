@@ -596,6 +596,7 @@ ProcessGroupNCCL::WorkNCCL::WorkNCCL(const WorkNCCL& w)
       futureWorkResult_(w.futureWorkResult_),
       timingEnabled_(w.timingEnabled_),
       trace_id_(w.trace_id_),
+      trace_reset_epoch_(w.trace_reset_epoch_),
       distDebugLevel_(w.distDebugLevel_) {
   exception_ = w.exception_;
 }
