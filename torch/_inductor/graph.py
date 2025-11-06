@@ -11,7 +11,7 @@ import sys
 import time
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Callable, NoReturn, Optional, TYPE_CHECKING, Union
+from typing import Any, NoReturn, Optional, TYPE_CHECKING, Union
 
 import sympy
 from sympy import Expr
@@ -117,7 +117,7 @@ from .virtualized import NullHandler, V
 
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Iterator, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Sequence
     from types import ModuleType
 
     from torch._higher_order_ops.effects import _EffectType
@@ -1590,7 +1590,7 @@ class GraphLowering(torch.fx.Interpreter):
 
         schema_kwargs = {arg.name: arg for arg in schema.arguments}
 
-        for key in old_kwargs.keys():
+        for key in old_kwargs:
             old_arg = old_kwargs[key]
             new_arg = new_kwargs[key]
             schema_arg = schema_kwargs[key]
