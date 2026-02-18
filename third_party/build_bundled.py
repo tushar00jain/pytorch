@@ -9,7 +9,13 @@ licenses = {'LICENSE', 'LICENSE.txt', 'LICENSE.rst', 'COPYING.BSD'}
 
 def collect_license(current):
     collected = {}
+    # Directories to skip during license collection (e.g., vcpkg port recipes that
+    # are not part of PyTorch's bundled code)
+    skip_patterns = ['vcpkg/ports']
     for root, dirs, files in os.walk(current):
+        # Skip directories that match skip patterns
+        if any(pattern in root for pattern in skip_patterns):
+            continue
         license = list(licenses & set(files))
         if license:
             name = root.split('/')[-1]
@@ -114,6 +120,8 @@ def identify_license(f, exception=''):
             return 'BSD-Source-Code'
         elif any([squeeze(m) in txt.lower() for m in mit_txt]):
             return 'MIT'
+        elif all([squeeze(m) in txt.lower() for m in postgresql_txt]):
+            return 'PostgreSQL'
         else:
             raise ValueError('unknown license')
 
@@ -165,6 +173,14 @@ bsd3_v1_txt = bsd3_txt[:3] + [v1]
 # This source variant of BSD-3 leaves the "redistributions in binary form" out
 # which is https://spdx.org/licenses/BSD-Source-Code.html
 bsd3_src_txt = bsd3_txt[:2] + bsd3_txt[4:]
+
+# PostgreSQL license pattern (using shorter fragments to handle C comment markers)
+postgresql_txt = ['permission to use, copy, modify, and distribute this software',
+                  'without fee',
+                  'written agreement is hereby granted',
+                  'in no event shall the author be liable',
+                  'the author specifically disclaims any warranties',
+                  ]
 
 
 if __name__ == '__main__':
