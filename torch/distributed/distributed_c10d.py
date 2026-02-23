@@ -148,6 +148,9 @@ try:
     # pyrefly: ignore [missing-import]
     from torchcomms.hooks import FlightRecorderHook
 
+    # pyrefly: ignore [missing-import]
+    from torchcomms.hooks import FlightRecorderHook
+
     _TORCHCOMM_AVAILABLE = True
 except ImportError:
     _TORCHCOMM_AVAILABLE = False
