@@ -145,6 +145,7 @@ _XCCL_AVAILABLE = True
 try:
     # pyrefly: ignore [missing-import]
     from torchcomms._comms import _BackendWrapper, new_comm
+    from torchcomms.hooks import FlightRecorderHook
 
     _TORCHCOMM_AVAILABLE = True
 except ImportError:
@@ -2057,6 +2058,8 @@ def _new_process_group_helper(
             comm = new_comm(
                 backend_str, torch_device, name=group_name, store=backend_prefix_store
             )
+            recorder = FlightRecorderHook(max_entries=100)
+            recorder.register_with_comm(comm)
             # Keep a reference so the comm outlives this function scope.
             _world.comms.append(comm)
             group_name = GroupName(group_name)
