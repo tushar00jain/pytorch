@@ -13,6 +13,7 @@ from typing import Any  # type: ignore[attr-defined]
 
 from torch.distributed.flight_recorder.components.fr_logger import FlightRecorderLogger
 from torch.distributed.flight_recorder.components.types import (
+    COLLECTIVES,
     Collective,
     Database,
     EntryState,
@@ -21,6 +22,7 @@ from torch.distributed.flight_recorder.components.types import (
     Membership,
     NCCLCall,
     Op,
+    P2P,
     Traceback,
 )
 from torch.distributed.flight_recorder.components.utils import (
@@ -248,6 +250,11 @@ def build_collectives(
                 )
                 all_coalesced_entries[curr] = grp
                 for _, entry in grp:
+                    # Skip non-collective operations (e.g. split, new_window)
+                    profiling_name = entry.get("profiling_name", "")
+                    op_type = profiling_name.split(":")[-1].split(" ")[0]
+                    if op_type not in COLLECTIVES | P2P | {"coalesced"}:
+                        continue
                     op = Op(entry, _memberships, pg_name)
                     peer = None
                     if op.type == "send":
