@@ -90,6 +90,7 @@ from .bytecode_transformation import (
 )
 from .code_context import code_context
 from .codegen import PyCodegen
+from .comprehension_graph_break import maybe_setup_comprehension_speculation
 from .exc import (
     augment_exc_message_with_hop_name,
     BackendCompilerFailed,
@@ -128,7 +129,6 @@ from .source import (
     SkipGuardSource,
     Source,
 )
-from .synthetic_function_graph_break import maybe_setup_comprehension_speculation
 from .trace_rules import is_builtin_constant, is_forbidden
 from .utils import (
     _get_error_on_graph_break,
@@ -143,7 +143,7 @@ from .utils import (
 )
 from .variables.base import typestr, ValueMutationNew, VariableTracker
 from .variables.builder import FrameStateSizeEntry, VariableBuilder, wrap_fx_proxy
-from .variables.builtin import BuiltinVariable
+from .variables.builtin import BuiltinVariable, DictBuiltinVariable
 from .variables.constant import CONSTANT_VARIABLE_NONE, ConstantVariable
 from .variables.ctx_manager import (
     ContextWrappingVariable,
@@ -284,6 +284,12 @@ class SpeculationLog:
     # If True, graph break at autograd.grad instead of tracing it.
     # Set when we detect that autograd.grad consumed grad_fns that are returned.
     graph_break_on_autograd_grad: bool = False
+    # Names of output tensors whose grad_fns were consumed by autograd.grad.
+    autograd_grad_leaked_tensors: list[str] = dataclasses.field(default_factory=list)
+    # If True, graph break at requires_grad_() on source-less intermediates
+    # instead of tracing it. Set when we detect that such an intermediate
+    # leaks as a graph output with requires_grad=True.
+    graph_break_on_requires_grad_: bool = False
 
     def restart(self) -> None:
         self.index = 0
@@ -668,6 +674,7 @@ def generic_jump(
                     return self.jump(inst)
                 elif self.should_compile_partial_graph():
                     jump_graph_break(self, inst, value)
+                    return
                 else:
                     unimplemented(
                         gb_type="Data-dependent assertion failed (cannot compile partial graph)",
@@ -739,7 +746,9 @@ def generic_jump(
             # ConstDictVariable is optimized to be very lazy about insertion of
             # guards, so we have to manually insert a SEQUENCE_LENGTH guard
             # here.
-            if isinstance(value, ConstDictVariable) and value.source:
+            if isinstance(value, BaseListVariable):
+                value._install_list_length_guard()
+            elif isinstance(value, ConstDictVariable) and value.source:
                 install_guard(value.source.make_guard(GuardBuilder.SEQUENCE_LENGTH))
             if truth_fn(value.as_python_constant()):
                 if push:
@@ -767,17 +776,19 @@ def generic_jump(
                     x = None
 
             # __bool__ or __len__ is function
-            if isinstance(x, UserMethodVariable):
+            if isinstance(x, (GetAttrVariable, UserMethodVariable)):
                 result = x.call_function(self, [], {})  # type: ignore[arg-type, assignment]
                 method_name = getattr(getattr(x, "fn", None), "__name__", None)
                 if result.is_python_constant():
                     result_value = result.as_python_constant()
                     if method_name == "__bool__" and not isinstance(result_value, bool):
-                        msg = VariableTracker.build(
+                        exc.raise_observed_exception(
+                            TypeError,
                             self,
-                            f"__bool__ should return bool, returned {type(result_value).__name__}",
+                            args=[
+                                f"__bool__ should return bool, returned {type(result_value).__name__}"
+                            ],
                         )
-                        exc.raise_observed_exception(TypeError, self, args=[msg])
                     if isinstance(result_value, (bool, int)) and truth_fn(result_value):
                         if push:
                             self.push(value)
@@ -1079,7 +1090,8 @@ class ExceptionStack:
         if len(self._exc_stack) + prev_idx > 0:
             prev = self._exc_stack[prev_idx]
             self._set_context_recursive(prev, prev_idx - 1)
-            val.set_context(prev)  # type: ignore[union-attr, arg-type]
+            if prev is not val:
+                val.set_context(prev)  # type: ignore[union-attr, arg-type]
         return val
 
     def _break_context_reference_cycle(self, val: ExceptionVals) -> None:
@@ -1604,9 +1616,8 @@ class InstructionTranslatorBase(
                         *create_copy(2),
                         cg.create_load_const(0),
                         cg.create_binary_subscr(),
-                        create_dup_top(),
                         *create_binary_slice(num_stack, None),
-                        *create_swap(2),
+                        *create_copy(3),
                         cg.create_load_const(0),
                         create_instruction("STORE_SUBSCR"),
                     ]
@@ -2026,7 +2037,7 @@ class InstructionTranslatorBase(
             self.exec_recorder.add_local_mod(recorded_name, value)
 
         # pyrefly: ignore [unbound-name]
-        if istype(value, (types.ModuleType, DummyModule)):
+        if isinstance(value, (types.ModuleType, DummyModule)):
             # pyrefly: ignore [unbound-name, bad-argument-type]
             self.push(PythonModuleVariable(value, source=source))
         else:
@@ -2205,18 +2216,16 @@ class InstructionTranslatorBase(
             TypeError,
             self,
             args=[
-                VariableTracker.build(
-                    self,
-                    f"exceptions must derive from BaseException, not {val.python_type_name()}",
-                )
+                f"exceptions must derive from BaseException, not {val.python_type_name()}",
             ],
         )
 
     def RAISE_VARARGS(self, inst: Instruction) -> None:
         if inst.arg == 0:
             if not len(self.exn_vt_stack):
-                msg = VariableTracker.build(self, "No active exception to reraise")
-                exc.raise_observed_exception(RuntimeError, self, args=[msg])
+                exc.raise_observed_exception(
+                    RuntimeError, self, args=["No active exception to reraise"]
+                )
 
             # re-raise the previous exception. Here CPython refers to the exception
             # on top of the exception stack
@@ -2660,7 +2669,7 @@ class InstructionTranslatorBase(
 
         # Unpack for cases like fn(**obj) where obj is a map
         if isinstance(kwargsvars, UserDefinedObjectVariable):
-            kwargsvars = BuiltinVariable.call_custom_dict(self, dict, kwargsvars)  # type: ignore[arg-type]
+            kwargsvars = DictBuiltinVariable.call_custom_dict(self, dict, kwargsvars)  # type: ignore[arg-type]
 
         # pyrefly: ignore [unbound-name]
         if not isinstance(argsvars, BaseListVariable) or not isinstance(
@@ -2978,21 +2987,12 @@ class InstructionTranslatorBase(
             )
 
         # add resume function to the global scope
-        if new_code.co_freevars:
-            # expose code object for debugging purposes
-            self.output.install_global_unsafe(resume_name, new_code)
-            package_name = None
-        else:
-            # This is safe: we pre-generate a unique name
-            self.output.install_global_unsafe(
-                resume_name,
-                types.FunctionType(new_code, self.f_globals, resume_name),
-            )
-            package_name = resume_name
-
+        self.output.install_resume_function_global(
+            resume_name, new_code, self.f_globals
+        )
         if self.package is not None:
             self.package.add_resume_function(
-                new_code, self.f_globals["__name__"], package_name
+                new_code, self.f_globals["__name__"], resume_name
             )
 
         counters["resumes"][new_code.co_name] += 1
@@ -3207,7 +3207,15 @@ class InstructionTranslatorBase(
                         cg.create_binary_subscr(),
                     ]
                 )
-                cg.make_function_with_closure(name, code)
+                # Call the factory function (stored under resume_name) to
+                # create the resume function with correct globals and closure.
+                cg.extend_output(
+                    [
+                        cg.create_load_global(name, add=True),
+                        *create_swap(2),
+                        *create_call_function(1, push_null=True),
+                    ]
+                )
             else:
                 cg.extend_output(cg.load_function_name(name, False, 0))
             cg.extend_output(create_swap(2))
@@ -3228,7 +3236,15 @@ class InstructionTranslatorBase(
                     cg.create_binary_subscr(),
                 ]
             )
-            cg.make_function_with_closure(resume_names[-1], resume_codes[-1])
+            # Call the factory function to create the resume function with
+            # correct globals and closure.
+            cg.extend_output(
+                [
+                    cg.create_load_global(resume_names[-1], add=True),
+                    *create_swap(2),
+                    *create_call_function(1, push_null=True),
+                ]
+            )
             cg.extend_output(
                 [
                     *create_rot_n(3),

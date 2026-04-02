@@ -226,6 +226,9 @@ def cudagraph_post_compile(
 
         placeholders = cached_info.placeholders
         stack_traces = cached_info.stack_traces
+        assert stack_traces is not None, (
+            "stack_traces should not be None in cudagraph_post_compile"
+        )
 
         prepare_cudagraph_post_compile(
             compiled_graph, example_inputs, boxed_forward_device_index
@@ -318,6 +321,9 @@ def cudagraph_partition_post_compile(
         k: v for k, v in constants.items() if isinstance(v, torch.Tensor)
     }
 
+    assert compiled_graph.cudagraph_info.stack_traces is not None, (
+        "stack_traces should not be None in cudagraph_partition_post_compile"
+    )
     graph_metadata = CudagraphMetadata(
         compiled_graph.cudagraph_info.placeholders,
         static_input_idxs,
@@ -367,14 +373,28 @@ def maybe_realign_inputs(
     we didn't end up running cudagraphs. Mutates
     `compiled_graph.current_callable` if cudagraphs
     was run. Otherwise, does nothing.
+
+    Non-mutated inputs are handled by deferred alignment copies
+    in the generated code. Only mutated inputs need the wrapper
+    for writeback.
     """
     if not ran_cudagraphs:
-        assert compiled_graph.current_callable is not None
-        new_callable = align_inputs_from_check_idxs(
-            compiled_graph.current_callable, inputs_to_check, mutated_inputs_idxs
-        )
-        if new_callable is not compiled_graph.current_callable:
-            compiled_graph.current_callable = new_callable
+        check_idxs = inputs_to_check
+        if compiled_graph._defers_input_alignment:
+            # Non-mutated inputs are handled by deferred alignment copies
+            # in the generated Python code. Only mutated inputs need the wrapper
+            # for writeback. Backends that don't emit deferred copies (cpp_wrapper,
+            # FXIR) need the full wrapper.
+            check_idxs = [i for i in inputs_to_check if i in mutated_inputs_idxs]
+        if check_idxs:
+            assert compiled_graph.current_callable is not None
+            new_callable = align_inputs_from_check_idxs(
+                compiled_graph.current_callable,
+                check_idxs,
+                mutated_inputs_idxs,
+            )
+            if new_callable is not compiled_graph.current_callable:
+                compiled_graph.current_callable = new_callable
 
 
 class CompiledFxGraphConstants:
@@ -468,6 +488,7 @@ class CompiledFxGraph(OutputCode):
     _boxed_call: bool | None = None
     _triton_bundle: TritonBundle | None = None
     _wrap_compiled_regions: bool = False
+    _defers_input_alignment: bool = False
     # Metadata-stripped copy of the FX graph for fake tensor propagation.
     # Running this graph under FakeTensorMode re-derives output shapes
     # (including aliasing) from the input shapes.
@@ -544,6 +565,7 @@ class CompiledFxGraph(OutputCode):
         self.extern_libs_key = None
         self.cudagraph_info = None
         self.partition_maps = graph.partition_maps
+        self._defers_input_alignment = getattr(graph, "_defers_input_alignment", False)
         self.fx_kwargs = {}
         self.inputs_to_check = ()
 
@@ -601,7 +623,10 @@ class CompiledFxGraph(OutputCode):
                 output = output_node(gm)
                 # output args are tuple of first argument
                 assert len(output.args) == 1
-                stack_traces = [
+                # Use stack traces captured on the output node before
+                # post-grad passes, which may strip stack_trace from
+                # individual arg nodes.
+                stack_traces = output.meta.get("output_stack_traces") or [
                     (arg.stack_trace if isinstance(arg, torch.fx.node.Node) else None)
                     for arg in output.args[0]  # type: ignore[union-attr]
                 ]
@@ -891,6 +916,15 @@ class CompiledAOTI(OutputCode):
                     self.device_type,
                     "",
                     True,
+                ).run  # type: ignore[attr-defined]
+            )  # type: ignore[attr-defined]
+        elif self.device_type.startswith("xpu"):
+            current_callable = (
+                torch._C._aoti.AOTIModelContainerRunnerXpu(  # type: ignore[call-arg]
+                    current_callable,
+                    1,
+                    self.device_type,
+                    "",
                 ).run  # type: ignore[attr-defined]
             )  # type: ignore[attr-defined]
         elif self.device_type == "cpu":
