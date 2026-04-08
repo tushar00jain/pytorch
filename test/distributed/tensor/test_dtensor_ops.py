@@ -128,18 +128,11 @@ def repurpose_ops(op_db, base_test_name, derived_test_name):
 # like python test/distributed/tensor/test_dtensor_ops.py > failed.expect
 dtensor_fails = {
     # view/reshape ops: rejects flatten/split of sharded dims without redistribution
-    xfail("cartesian_prod"),
-    xfail("flatten"),
-    xfail("kron"),
-    xfail("ravel"),
     xfail("repeat_interleave"),
     xfail("reshape"),
-    xfail("reshape_as"),
-    xfail("take_along_dim"),
     xfail("unbind"),
     xfail("unflatten"),
     xfail("view"),
-    xfail("view_as"),
     # factory/creation ops: test harness can't convert non-tensor args to DTensor
     xfail("arange"),
     xfail("broadcast_shapes"),
@@ -257,6 +250,7 @@ dtensor_fails = {
 }
 
 dtensor_multi_threaded_fails = {
+    xfail("index_fill"),
     xfail("full_like"),
     xfail("nn.functional.dropout2d"),
     xfail("nn.functional.dropout3d"),
@@ -268,6 +262,15 @@ dtensor_multi_threaded_fails = {
 # Ops that fail to compile with DTensor + torch.compile(fullgraph=True).
 # These are compile-time failures, NOT numeric correctness issues.
 dtensor_compiled_fails = {
+    xfail("cartesian_prod"),
+    xfail("flatten"),
+    xfail("kron"),
+    xfail("linalg.tensorsolve"),
+    xfail("nn.functional.instance_norm"),
+    xfail("ravel"),
+    xfail("reshape_as"),
+    xfail("take_along_dim"),
+    xfail("view_as"),
     # View-type ops that decompose into as_strided (at autograd level).
     # DTensor doesn't have a sharding strategy for as_strided.
     xfail("atleast_1d"),
@@ -315,10 +318,17 @@ dtensor_compiled_fails = {
     xfail("nn.functional.logsigmoid"),
     # Miscellaneous runtime crashes (e.g. index out of bounds).
     xfail("gather"),
+    xfail("index_add"),
+    xfail("index_copy"),
+    xfail("index_reduce", "amax"),
+    xfail("index_reduce", "amin"),
+    xfail("index_reduce", "mean"),
+    xfail("index_reduce", "prod"),
     xfail("index_select"),
     xfail("lu_unpack"),
     xfail("scatter"),
     xfail("scatter_add"),
+    xfail("take_along_dim"),
     # batch_norm variants decompose through squeeze.dims → as_strided under
     # compilation, and DTensor has no as_strided strategy.
     xfail("_native_batch_norm_legit"),
@@ -390,16 +400,8 @@ dtensor_fails_no_strategy = {
     xfail("grid_sampler_2d"),
     xfail("histogram"),
     xfail("histogramdd"),
-    xfail("index_add"),
-    xfail("index_copy"),
-    xfail("index_fill"),
-    xfail("index_reduce", "prod"),
-    xfail("index_reduce", "mean"),
-    xfail("index_reduce", "amax"),
-    xfail("index_reduce", "amin"),
     xfail("isin"),
     xfail("linalg.matrix_power"),
-    xfail("linalg.tensorsolve"),
     xfail("linspace", "tensor_overload"),
     xfail("log_normal"),
     xfail("logspace", "tensor_overload"),
@@ -410,7 +412,6 @@ dtensor_fails_no_strategy = {
     xfail("nn.functional.bilinear"),
     xfail("nn.functional.grid_sample"),
     xfail("nn.functional.group_norm"),
-    xfail("nn.functional.instance_norm"),
     xfail("nn.functional.interpolate", "nearest"),
     xfail("nn.functional.interpolate", "nearest-exact"),
     xfail("nn.functional.max_unpool1d"),
@@ -809,7 +810,13 @@ ops_unbacked_dtensor_dde = {
     xfail("float"),
     xfail("gather"),
     xfail("histc"),
+    xfail("index_add"),
+    xfail("index_copy"),
     xfail("index_put"),
+    xfail("index_reduce", "amax"),
+    xfail("index_reduce", "amin"),
+    xfail("index_reduce", "mean"),
+    xfail("index_reduce", "prod"),
     xfail("index_select"),
     xfail("kthvalue"),
     xfail("linalg.lu"),
@@ -842,6 +849,7 @@ ops_unbacked_dtensor_dde = {
     xfail("nn.functional.conv_transpose2d"),
     xfail("nn.functional.conv_transpose3d"),
     xfail("nn.functional.cosine_embedding_loss"),
+    xfail("nn.functional.glu"),
     xfail("nn.functional.hinge_embedding_loss"),
     xfail("nn.functional.interpolate", "nearest"),
     xfail("nn.functional.interpolate", "nearest-exact"),
@@ -866,7 +874,6 @@ ops_unbacked_dtensor_dde = {
     xfail("rot90"),
     xfail("scatter"),
     xfail("scatter_add"),
-    xfail("slice"),
     xfail("sort"),
     xfail("squeeze_copy"),
     xfail("std_mean"),

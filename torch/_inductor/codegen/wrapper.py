@@ -50,7 +50,6 @@ from ..runtime.hints import DeviceProperties
 from ..stream_constants import DEFAULT_STREAM, DEFAULT_STREAM_IDX, STREAM_NAME_TEMPLATE
 from ..stream_utils import get_stream_name
 from ..utils import (
-    ALIGNMENT,
     cache_on_self,
     DelayReplaceLine,
     get_benchmark_name,
@@ -1603,7 +1602,6 @@ class PythonWrapperCodegen(CodeGen):
         for name, buf in self.get_graph_inputs().items():
             if isinstance(buf, (sympy.Expr, ir.TorchBindObject)):
                 continue
-
             line = f"assert not {name}.isnan().any().item()"
             self.prefix.writeline(line)
             line = f"assert not {name}.isinf().any().item()"
@@ -1717,7 +1715,7 @@ class PythonWrapperCodegen(CodeGen):
         if self._pending_alignment_copies:
             V.graph._defers_input_alignment = True
             self.imports.writeline(
-                "from torch._inductor.utils import clone_preserve_strides"
+                "from torch._C._dynamo.guards import copy_misaligned"
             )
 
     def codegen_deferred_alignment_copies(self, input_names: Iterable[str]) -> None:
@@ -1728,8 +1726,7 @@ class PythonWrapperCodegen(CodeGen):
         for name in input_names:
             if name in self._pending_alignment_copies:
                 self._pending_alignment_copies.discard(name)
-                self.writeline(f"if {name}.data_ptr() % {ALIGNMENT} != 0:")
-                self.writeline(f"    {name} = clone_preserve_strides({name})")
+                self.writeline(f"{name} = copy_misaligned({name})")
 
     # this function (and below) takes the graph name as input so
     # that stream caching happens per graph instance. this
@@ -3293,7 +3290,7 @@ class PythonWrapperCodegen(CodeGen):
         current_stream_idx=None,
     ):
         device = device or V.graph.get_current_device_or_throw()
-        if not triton and device.type != "cuda":
+        if not triton and device.type not in ("cuda", "xpu"):
             if device.type == "cpu":
                 self.writeline(self.wrap_kernel_call(kernel_name, call_args))
             elif device.type == "mps":
@@ -3402,7 +3399,7 @@ class PythonWrapperCodegen(CodeGen):
 
             reused_args = {}
             for i, (arg, arg_type, raw_key, raw_arg) in enumerate(
-                # pyrefly: ignore [no-matching-overload]
+                # pyrefly: ignore [bad-argument-type, no-matching-overload]
                 zip(call_args, arg_types, raw_keys, raw_args)
             ):
                 key = None

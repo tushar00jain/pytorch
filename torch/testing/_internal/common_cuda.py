@@ -24,7 +24,6 @@ else:
     TEST_CUDNN = LazyVal(lambda: TEST_CUDA and torch.backends.cudnn.is_acceptable(torch.tensor(1., device=CUDA_DEVICE)))
 
 TEST_CUDNN_VERSION = LazyVal(lambda: torch.backends.cudnn.version() if TEST_CUDNN else 0)
-TEST_HIPDNN = LazyVal(lambda: TEST_CUDA and torch.backends.hipdnn.is_available())
 ROCM_VERSION = LazyVal(lambda : tuple(int(v) for v in torch.version.hip.split('.')[:2]) if torch.version.hip else (0, 0))
 
 SM53OrLater = LazyVal(lambda: torch.cuda.is_available() and torch.cuda.get_device_capability() >= (5, 3))
@@ -44,6 +43,7 @@ IS_JETSON = LazyVal(lambda: torch.cuda.is_available() and (torch.cuda.get_device
 IS_SM89 = LazyVal(lambda: torch.cuda.is_available() and torch.cuda.get_device_capability() == (8, 9))
 IS_SM90 = LazyVal(lambda: torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0))
 IS_SM100 = LazyVal(lambda: torch.cuda.is_available() and torch.cuda.get_device_capability() == (10, 0))
+IS_SM12X = LazyVal(lambda: torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 12)
 
 @contextlib.contextmanager
 def blas_library_context(backend):
@@ -222,7 +222,7 @@ if TEST_NUMBA:
     try:
         import numba.cuda
         TEST_NUMBA_CUDA = numba.cuda.is_available()
-    except (ImportError, RuntimeError):
+    except (ImportError, RuntimeError, OSError):
         TEST_NUMBA_CUDA = False
         TEST_NUMBA = False
 else:
@@ -463,6 +463,9 @@ def xfailIfSM100OrLater(func):
 
 def xfailIfSM120OrLater(func):
     return func if not SM120OrLater else unittest.expectedFailure(func)
+
+def xfailIfSM12X(func):
+    return func if not IS_SM12X else unittest.expectedFailure(func)
 
 def xfailIfDistributedNotSupported(func):
     return func if not (IS_MACOS or IS_JETSON) else unittest.expectedFailure(func)

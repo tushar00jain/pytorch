@@ -2726,21 +2726,34 @@ if KinetoStepTracker.current_step() != initial_step + 2 * niters:
                 y = torch.randn(10, 10)
                 z = torch.mm(x, y)
 
-    @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
     @unittest.skipIf(not kineto_available(), "Kineto is required")
-    def test_activity_filter_backward_compat(self):
-        """Plain activities=[CPU] still works unchanged."""
-        with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as p:
-            x = torch.randn(10, 10).to("cuda")
-            y = torch.mm(x, x)
+    def test_profiler(self):
+        """Basic test for torch.profiler.profile API."""
+        use_cuda = torch.profiler.ProfilerActivity.CUDA in supported_activities()
+        activities = [ProfilerActivity.CPU]
+        if use_cuda:
+            activities.append(ProfilerActivity.CUDA)
+        with profile(activities=activities) as p:
+            self.payload(use_cuda=use_cuda)
         events = p.events()
         self.assertGreater(len(events), 0)
-        has_overhead = any(
-            "Lazy Function Loading" in e.name for e in events
-        )  # Lazy Function Loading is an OVERHEAD event
-        self.assertTrue(has_overhead)
+        found_gemm = False
+        found_memcpy = False
+        found_mm = False
+        for e in events:
+            if "aten::mm" in e.name:
+                found_mm = True
+            if "gemm" in e.name.lower() or "Cijk" in e.name:
+                found_gemm = True
+            if "memcpy" in e.name.lower() or "__amd_rocclr_copyBuffer" in e.name:
+                found_memcpy = True
+        self.assertTrue(found_mm)
+        if use_cuda:
+            self.assertTrue(found_gemm)
+            self.assertTrue(found_memcpy)
 
     @unittest.skipIf(not torch.cuda.is_available(), "requires CUDA")
+    @unittest.skipIf(TEST_WITH_ROCM, "not supported on ROCm")
     @unittest.skipIf(not kineto_available(), "Kineto is required")
     def test_activity_filter_dict_syntax(self):
         """Dict syntax collects only the requested activity types."""
@@ -3987,6 +4000,62 @@ class TestProfilerEventsParity(TestCase):
                     json_name_cats,
                     f"activity_type mismatch for {e.name}",
                 )
+
+    def test_structured_metadata_matches_chrome_trace(self):
+        from torch.autograd.profiler_util import _EVENT_METADATA_KEYS
+
+        with profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            experimental_config=torch._C._profiler._ExperimentalConfig(
+                expose_kineto_event_metadata=True
+            ),
+        ) as prof:
+            x = torch.randn(10, 10, device="cuda")
+            y = torch.mm(x, x)
+            z = x + y
+            z.cpu()
+
+        # Build lookup from External id -> FunctionEvent
+        fe_by_ext_id = {}
+        for fe in prof.events():
+            if fe.external_id != 0:
+                fe_by_ext_id[fe.external_id] = fe
+
+        with TemporaryFileName(mode="w+") as fname:
+            prof.export_chrome_trace(fname)
+            with open(fname) as f:
+                trace = json.load(f)
+
+            checked_kernel = 0
+            checked_memcpy = 0
+            for te in trace["traceEvents"]:
+                cat = te.get("cat", "")
+                args = te.get("args", {})
+                ext_id = args.get("External id")
+                if ext_id is None or ext_id not in fe_by_ext_id:
+                    continue
+                fe = fe_by_ext_id[ext_id]
+
+                if cat in ("kernel", "gpu_memcpy") and fe.event_metadata is not None:
+                    em = fe.event_metadata
+                    for kineto_key, (field_name, _) in _EVENT_METADATA_KEYS.items():
+                        if kineto_key in args:
+                            val = getattr(em, field_name)
+                            self.assertIsNotNone(
+                                val,
+                                f"'{fe.name}': {field_name} is None "
+                                f"but JSON has '{kineto_key}': {args[kineto_key]}",
+                            )
+                    if cat == "kernel":
+                        self.assertIsInstance(em.registers_per_thread, int)
+                        self.assertGreater(em.registers_per_thread, 0)
+                        checked_kernel += 1
+                    elif cat == "gpu_memcpy":
+                        if em.bytes is not None:
+                            self.assertGreater(em.bytes, 0)
+                        checked_memcpy += 1
+
+            self.assertGreater(checked_kernel, 0, "No kernel events were cross-checked")
 
 
 if __name__ == "__main__":
