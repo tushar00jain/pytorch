@@ -165,6 +165,66 @@ class SplitGroupBackendWrapperTest(SplitGroupTestBase):
     def test_split_group_mixed_backend_subgroups(self):
         self._test_split_group_mixed_backend_subgroups()
 
+    def _assert_mixed_backend_wrappers_are_distinct(self, pg):
+        """Assert pg has separate _BackendWrapper objects per device, each
+        wrapping its declared underlying backend.
+
+        Regression guard: when ProcessGroup::setBackend deduplicated by
+        BackendType and torchcomms registered every wrapper as
+        BackendType.CUSTOM, the second register call (cuda → nccl) silently
+        reused the first (gloo) wrapper. The functional split_group tests
+        above pass even with that bug because TorchCommGloo.all_reduce on a
+        cuda tensor copies to CPU + runs gloo + copies back, so the math is
+        right. This identity check fails fast instead.
+        """
+        try:
+            from torchcomms._comms import _BackendWrapper
+        except ImportError:
+            from torchcomms._backend_wrapper import _BackendWrapper
+
+        cuda_backend = pg._get_backend(torch.device("cuda"))
+        cpu_backend = pg._get_backend(torch.device("cpu"))
+
+        self.assertIsNot(
+            cuda_backend,
+            cpu_backend,
+            "cuda and cpu backends share an object — ProcessGroup::setBackend "
+            "deduplicated distinct torchcomms wrappers (was BackendType.CUSTOM "
+            "for both); cuda collectives would silently route through gloo.",
+        )
+        self.assertIsInstance(cuda_backend, _BackendWrapper)
+        self.assertIsInstance(cpu_backend, _BackendWrapper)
+        self.assertEqual(cuda_backend.get_comm().get_backend(), "nccl")
+        self.assertEqual(cpu_backend.get_comm().get_backend(), "gloo")
+
+    @skip_if_lt_x_gpu(4)
+    @dist_config.patch(use_torchcomms=True)
+    @_with_torchcomm_env
+    def test_mixed_backend_init_uses_distinct_per_device_wrappers(self):
+        """Right after init_process_group('cpu:gloo,cuda:nccl'), the WORLD PG
+        must hold distinct nccl + gloo wrappers, not a single deduplicated
+        wrapper reused for both devices."""
+        self._init_pg("cpu:gloo,cuda:nccl")
+        try:
+            self._assert_mixed_backend_wrappers_are_distinct(dist.group.WORLD)
+        finally:
+            dist.destroy_process_group()
+
+    @skip_if_lt_x_gpu(4)
+    @dist_config.patch(use_torchcomms=True)
+    @_with_torchcomm_env
+    def test_split_group_mixed_backend_keeps_per_device_wrappers(self):
+        """split_group on a mixed cpu:gloo,cuda:nccl parent must produce a
+        child PG that also has distinct nccl + gloo wrappers. (split_group
+        re-invokes _new_process_group_helper, so the same dedup bug
+        applies.)"""
+        self._init_pg("cpu:gloo,cuda:nccl")
+        try:
+            split_pg = dist.split_group(split_ranks=[list(range(self.world_size))])
+            self._assert_mixed_backend_wrappers_are_distinct(split_pg)
+        finally:
+            dist.destroy_process_group()
+
 
 if __name__ == "__main__":
     run_tests()
