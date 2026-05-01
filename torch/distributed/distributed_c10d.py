@@ -2080,7 +2080,23 @@ def _new_process_group_helper(
             _world.comms.append(comm)
             group_name = GroupName(group_name)
             backend_class = _BackendWrapper(comm)
-            backend_type = ProcessGroup.BackendType.CUSTOM
+            # Map each torchcomms wrapper to its underlying backend's canonical
+            # type so ProcessGroup::setBackend doesn't deduplicate distinct
+            # wrappers in mixed-backend PGs (e.g. cpu:gloo,cuda:nccl). With
+            # BackendType.CUSTOM, the second _register_backend call would
+            # silently reuse the first (gloo) wrapper for cuda lookups,
+            # causing dist.all_gather_into_tensor on cuda tensors to route
+            # through TorchCommGloo + CPU round-trip.
+            _torchcomms_backend_type_map = {
+                Backend.NCCL: ProcessGroup.BackendType.NCCL,
+                Backend.GLOO: ProcessGroup.BackendType.GLOO,
+                Backend.UCC: ProcessGroup.BackendType.UCC,
+                Backend.MPI: ProcessGroup.BackendType.MPI,
+                Backend.XCCL: ProcessGroup.BackendType.XCCL,
+            }
+            backend_type = _torchcomms_backend_type_map.get(
+                backend_str, ProcessGroup.BackendType.CUSTOM
+            )
         elif backend_str == Backend.MPI:
             if not is_mpi_available():
                 raise RuntimeError(
