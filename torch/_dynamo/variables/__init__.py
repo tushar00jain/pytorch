@@ -21,14 +21,11 @@ from .builtin import (
     BaseBuiltinVariable,
     BuiltinVariable,
     DictBuiltinVariable,
+    GetAttrBuiltinVariable,
     IterBuiltinVariable,
+    ListBuiltinVariable,
 )
-from .constant import (
-    CONSTANT_VARIABLE_FALSE,
-    CONSTANT_VARIABLE_NONE,
-    CONSTANT_VARIABLE_TRUE,
-    ConstantVariable,
-)
+from .constant import ConstantVariable
 from .ctx_manager import (
     CatchWarningsCtxManagerVariable,
     ContextWrappingVariable,
@@ -55,16 +52,10 @@ from .ctx_manager import (
 )
 from .dicts import (
     ConstDictVariable,
-    DefaultDictVariable,
     DictItemsVariable,
-    DictKeySetVariable,
     DunderDictVariable,
-    FrozensetVariable,
     MappingProxyVariable,
     NNModuleHooksDictVariable,
-    OrderedSetClassVariable,
-    OrderedSetVariable,
-    SetVariable,
 )
 from .distributed import BackwardHookVariable, DistributedVariable
 from .functions import (
@@ -104,7 +95,6 @@ from .iter import (
     IteratorVariable,
     ItertoolsVariable,
     MapVariable,
-    ObjectIteratorVariable,
     RepeatIteratorVariable,
     ZipVariable,
 )
@@ -149,6 +139,13 @@ from .nn_module import (
 )
 from .optimizer import OptimizerVariable
 from .sdpa import SDPAParamsVariable
+from .sets import (
+    DictKeySetVariable,
+    FrozensetVariable,
+    OrderedSetClassVariable,
+    OrderedSetVariable,
+    SetVariable,
+)
 from .streams import (
     CudaStreamVariable,
     EventVariable,
@@ -166,13 +163,16 @@ from .tensor import (
 )
 from .torch import TorchCtxManagerClassVariable, TorchInGraphFunctionVariable
 from .user_defined import (
+    DefaultDictVariable,
     FrozenDataClassVariable,
     InspectVariable,
     MutableMappingVariable,
     NamedTupleVariable,
+    OrderedDictVariable,
     RemovableHandleVariable,
     StructSequenceVariable,
     UserDefinedClassVariable,
+    UserDefinedConstantVariable,
     UserDefinedDictVariable,
     UserDefinedExceptionClassVariable,
     UserDefinedExceptionObjectVariable,
@@ -192,9 +192,6 @@ __all__ = [
     "BaseListVariable",
     "BuiltinVariable",
     "CatchWarningsCtxManagerVariable",
-    "CONSTANT_VARIABLE_FALSE",
-    "CONSTANT_VARIABLE_NONE",
-    "CONSTANT_VARIABLE_TRUE",
     "ConstantVariable",
     "ConstDictVariable",
     "DictBuiltinVariable",
@@ -210,6 +207,7 @@ __all__ = [
     "DictKeySetVariable",
     "DynamoConfigPatchVariable",
     "FakeItemVariable",
+    "GetAttrBuiltinVariable",
     "GetAttrVariable",
     "GradModeVariable",
     "InspectSignatureVariable",
@@ -220,6 +218,7 @@ __all__ = [
     "LambdaVariable",
     "LazyConstantVariable",
     "LazyVariableTracker",
+    "ListBuiltinVariable",
     "ListIteratorVariable",
     "ListVariable",
     "NestedUserFunctionVariable",
@@ -227,6 +226,7 @@ __all__ = [
     "NewGlobalVariable",
     "NNModuleVariable",
     "NumpyNdarrayVariable",
+    "OrderedDictVariable",
     "NumpyVariable",
     "OptimizerVariable",
     "PolyfilledFunctionVariable",

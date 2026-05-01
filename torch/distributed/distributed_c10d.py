@@ -1021,7 +1021,7 @@ def _store_based_barrier(
         except RuntimeError as e:
             worker_count = store.add(store_key, 0)
             # Print status periodically to keep track.
-            logger.debug(  # noqa: G200
+            logger.debug(
                 "Waiting in store based barrier to initialize process group for %s seconds"
                 "rank: %s, key: %s (world_size=%s, num_workers_joined=%s, timeout=%s error=%s)",
                 time.time() - start,
@@ -2080,7 +2080,23 @@ def _new_process_group_helper(
             _world.comms.append(comm)
             group_name = GroupName(group_name)
             backend_class = _BackendWrapper(comm)
-            backend_type = ProcessGroup.BackendType.CUSTOM
+            # Map each torchcomms wrapper to its underlying backend's canonical
+            # type so ProcessGroup::setBackend doesn't deduplicate distinct
+            # wrappers in mixed-backend PGs (e.g. cpu:gloo,cuda:nccl). With
+            # BackendType.CUSTOM, the second _register_backend call would
+            # silently reuse the first (gloo) wrapper for cuda lookups,
+            # causing dist.all_gather_into_tensor on cuda tensors to route
+            # through TorchCommGloo + CPU round-trip.
+            _torchcomms_backend_type_map = {
+                Backend.NCCL: ProcessGroup.BackendType.NCCL,
+                Backend.GLOO: ProcessGroup.BackendType.GLOO,
+                Backend.UCC: ProcessGroup.BackendType.UCC,
+                Backend.MPI: ProcessGroup.BackendType.MPI,
+                Backend.XCCL: ProcessGroup.BackendType.XCCL,
+            }
+            backend_type = _torchcomms_backend_type_map.get(
+                backend_str, ProcessGroup.BackendType.CUSTOM
+            )
         elif backend_str == Backend.MPI:
             if not is_mpi_available():
                 raise RuntimeError(
@@ -4382,22 +4398,26 @@ def all_gather_coalesced(
         Async work handle, if async_op is set to True.
         None, if not async_op or if not part of the group
 
-    Example:
-        we have 2 process groups, 2 ranks.
-        rank 0 passes:
-            input_tensor_list = [[[1, 1], [1, 1]], [2], [3, 3]]
-            output_tensor_lists =
-               [[[[-1, -1], [-1, -1]], [-1], [-1, -1]],
-                [[[-1, -1], [-1, -1]], [-1], [-1, -1]]]
-        rank 1 passes:
-            input_tensor_list = [[[3, 3], [3, 3]], [5], [1, 1]]
-            output_tensor_lists =
-               [[[[-1, -1], [-1, -1]], [-1], [-1, -1]],
-                [[[-1, -1], [-1, -1]], [-1], [-1, -1]]]
-        both rank 0 and 1 get:
-            output_tensor_lists =
-               [[[1, 1], [1, 1]], [2], [3, 3]],
-                [[3, 3], [3, 3]], [5], [1, 1]]].
+    Example::
+
+        # we have 2 process groups, 2 ranks.
+        # rank 0 passes:
+        input_tensor_list = [[[1, 1], [1, 1]], [2], [3, 3]]
+        output_tensor_lists = [
+            [[[-1, -1], [-1, -1]], [-1], [-1, -1]],
+            [[[-1, -1], [-1, -1]], [-1], [-1, -1]],
+        ]
+        # rank 1 passes:
+        input_tensor_list = [[[3, 3], [3, 3]], [5], [1, 1]]
+        output_tensor_lists = [
+            [[[-1, -1], [-1, -1]], [-1], [-1, -1]],
+            [[[-1, -1], [-1, -1]], [-1], [-1, -1]],
+        ]
+        # both rank 0 and 1 get:
+        output_tensor_lists = [
+            [[[1, 1], [1, 1]], [2], [3, 3]],
+            [[[3, 3], [3, 3]], [5], [1, 1]],
+        ]
 
     WARNING: at this time individual shape checking is not implemented across nodes.
     For example, if the rank 0 node passes [torch.rand(4), torch.rand(2)] and the
@@ -5719,7 +5739,7 @@ def _new_group_with_tag(
     _check_valid_timeout(timeout)
 
     if use_local_synchronization:
-        # MPI backend doesn't have have a way for us to perform a partial sync
+        # MPI backend doesn't have a way for us to perform a partial sync
         if backend == Backend.MPI:
             raise ValueError(
                 "MPI backend doesn't support use_local_synchronization=True"

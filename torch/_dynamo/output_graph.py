@@ -35,7 +35,7 @@ import traceback
 import types
 import warnings
 import weakref
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from dataclasses import dataclass, field as dc_field
 from types import CodeType
 from typing import Any, cast, Optional, TYPE_CHECKING, Union
@@ -63,6 +63,7 @@ from torch._library.fake_class_registry import FakeScriptObject
 from torch._library.opaque_object import is_opaque_type
 from torch._subclasses.fake_tensor import FakeTensor
 from torch._utils_internal import signpost_event
+from torch.export.dynamic_shapes import _ConstraintTarget
 from torch.fx._lazy_graph_module import _make_graph_module  # type: ignore[attr-defined]
 from torch.fx.experimental._backward_state import BackwardState
 from torch.fx.experimental.symbolic_shapes import (
@@ -176,8 +177,8 @@ from .variables.user_defined import UserDefinedDictVariable
 
 
 if TYPE_CHECKING:
-    from torch._dynamo.compile_options import DynamoCompileOptions
     from torch._dynamo.dynamo_profiler import DynamoProfilerState
+    from torch._dynamo.package import CompilePackage
     from torch._dynamo.symbolic_convert import InstructionTranslatorBase
     from torch._inductor import _CudagraphAnnotation
     from torch.multiprocessing.reductions import StorageWeakRef
@@ -227,6 +228,7 @@ class AliasingInfo:
 class MutationInfo:
     has_mutation: bool
     msg: str
+    mutated_input_indices: tuple[int, ...] = ()
 
 
 def collect_reachable_grad_fns(
@@ -601,12 +603,15 @@ class OutputGraph(OutputGraphCommon):
         code_options: dict[str, Any],
         compiler_fn: CompilerFn | None,
         root_tx: "InstructionTranslatorBase",
-        compile_options: "DynamoCompileOptions",
+        export: bool,
+        export_constraints: Sequence[_ConstraintTarget],
         frame_state: Any,
         local_scope: Scope,
         global_scope: Scope,
         f_code: CodeType,
         torch_function_mode_stack: list[torch.overrides.TorchFunctionMode],
+        package: Optional["CompilePackage"],
+        one_graph: bool = False,
     ) -> None:
         OutputGraphGuardsState.__init__(
             self,
@@ -625,7 +630,6 @@ class OutputGraph(OutputGraphCommon):
             _guards=torch._guards.GuardsSet(),
             _aotautograd_guards=[],
         )
-        export = compile_options.export
         self.tracers = [SubgraphTracer(self, is_export=export)]
         # Map from graph input's `Source` to its `VariableTracker` to
         # de-duplicate graph inputs by source and reuse the tracker
@@ -635,7 +639,7 @@ class OutputGraph(OutputGraphCommon):
         # tracked separately from input_source_to_var for backward() auto-detection.
         self.leaf_var_creation_order: list[VariableTracker] = []
         self.export = export
-        self.export_constraints = compile_options.export_constraints  # type: ignore[assignment]
+        self.export_constraints = export_constraints  # type: ignore[assignment]
         self.frame_state = frame_state
         self.cleanup_hooks: list[Callable[[], Any]] = []
         # compile_id is an id number for the current torch.compile
@@ -676,9 +680,8 @@ class OutputGraph(OutputGraphCommon):
             # the program execution.
             tracked_fakes=self.tracked_fakes,
             # We want to allow capture scalar outputs and allow_dynamic_output_shape_ops when fullgraph=True
-            allow_scalar_outputs=compile_options.one_graph
-            or config.capture_scalar_outputs,
-            allow_dynamic_output_shape_ops=compile_options.one_graph
+            allow_scalar_outputs=one_graph or config.capture_scalar_outputs,
+            allow_dynamic_output_shape_ops=one_graph
             or config.capture_dynamic_output_shape_ops,
             prefer_deferred_runtime_asserts_over_guards=config.prefer_deferred_runtime_asserts_over_guards,
             co_fields=self.co_fields,
@@ -758,7 +761,7 @@ class OutputGraph(OutputGraphCommon):
         # Profiler state for tracking function trace timings
         self.profiler_state: DynamoProfilerState | None = None
 
-        self.package = compile_options.package
+        self.package = package
         # Given a source, what are the user stacks of all locations that
         # accessed it?
         #
@@ -871,6 +874,62 @@ class OutputGraph(OutputGraphCommon):
         self.used_inlined_inbuilt_modules_names: OrderedSet[str] = OrderedSet()
 
         self.attr_source_cache: dict[tuple[Source, str], AttrSource] = {}
+        self._cached_replayed_side_effect_source_refs: tuple[str, ...] | None = None
+
+    def get_replayed_side_effect_source_refs(
+        self, *, populate_export_metadata: bool = False
+    ) -> list[str]:
+        """Return Python-side effect sources that Dynamo replays outside the FX graph."""
+        if (
+            not populate_export_metadata
+            and not self.side_effects.id_to_variable
+            and self._cached_replayed_side_effect_source_refs is not None
+        ):
+            return list(self._cached_replayed_side_effect_source_refs)
+
+        from torch.export._trace import _ExportModuleSpecTrackerDict
+
+        potential_side_effects = []
+        for var in self.side_effects._get_modified_vars():
+            if hasattr(var, "mutation_type"):
+                mut_type = var.mutation_type
+                # Skip codegen-specific mutations that never materialize as
+                # externally visible Python side effects.
+                if isinstance(
+                    mut_type, (AttributeMutationExisting, ValueMutationExisting)
+                ):
+                    if isinstance(var, UserDefinedDictVariable) and isinstance(
+                        var.value, _ExportModuleSpecTrackerDict
+                    ):
+                        if populate_export_metadata:
+                            assert var._base_vt is not None
+                            for (
+                                k,
+                                v,
+                            ) in (
+                                var._base_vt.items.items()  # pyrefly: ignore[missing-attribute]
+                            ):
+                                # pyrefly: ignore [implicit-any]
+                                specs = {}
+                                # pyrefly: ignore[missing-attribute]
+                                for k_spec, val in v.items.items():
+                                    specs[k_spec.vt.as_python_constant()] = (
+                                        val.as_python_constant()
+                                    )
+                                assert ["in_spec", "out_spec"] == list(specs.keys())
+                                self.export_metadata.module_call_spec[
+                                    # pyrefly: ignore[missing-attribute]
+                                    k.vt.as_python_constant()
+                                ] = specs
+                    # export uses tracepoint pass to dump submodule inp/out spec
+                    # into global state, so we filter it here
+                    if not (
+                        isinstance(var, UserDefinedDictVariable)
+                        and isinstance(var.value, _ExportModuleSpecTrackerDict)
+                    ):
+                        potential_side_effects.append(var)
+
+        return [_get_source_debug_name(var.source) for var in potential_side_effects]
 
     def get_chained_attr_source(self, base: Source, path: str) -> AttrSource:
         parts = path.split(".")
@@ -1278,17 +1337,20 @@ class OutputGraph(OutputGraphCommon):
 
         global_state["grad_enabled"] = (torch.set_grad_enabled, torch.is_grad_enabled())
 
+        gpu_type = (
+            acc.type if (acc := torch.accelerator.current_accelerator()) else "cuda"
+        )
         global_state["autocast_enabled"] = (
-            functools.partial(torch.set_autocast_enabled, "cuda"),
-            torch.is_autocast_enabled("cuda"),
+            functools.partial(torch.set_autocast_enabled, gpu_type),
+            torch.is_autocast_enabled(gpu_type),
         )
         global_state["autocast_cpu_enabled"] = (
             functools.partial(torch.set_autocast_enabled, "cpu"),
             torch.is_autocast_enabled("cpu"),
         )
         global_state["autocast_gpu_dtype"] = (  # type:ignore[assignment]
-            functools.partial(torch.set_autocast_dtype, "cuda"),
-            torch.get_autocast_dtype("cuda"),
+            functools.partial(torch.set_autocast_dtype, gpu_type),
+            torch.get_autocast_dtype(gpu_type),
         )
         global_state["autocast_cpu_dtype"] = (  # type:ignore[assignment]
             functools.partial(torch.set_autocast_dtype, "cpu"),
@@ -1487,7 +1549,7 @@ class OutputGraph(OutputGraphCommon):
             # HACKY CODE REGION BEGIN
             # WE ARE PIGGYBACKING ON EXISTING INFRA TO REGISTER ATTRS
             # This ultimately gets written to self.nn_modules, which is unfortunate
-            # Attrs that are tenors and symints and such need to be migrated to have their
+            # Attrs that are tensors and symints and such need to be migrated to have their
             # own storage
             # alas, this is like this for now
 
@@ -2173,49 +2235,9 @@ class OutputGraph(OutputGraphCommon):
             )
 
         if torch._dynamo.config.side_effect_replay_policy in ["warn", "error"]:
-            from torch.export._trace import _ExportModuleSpecTrackerDict
-
-            potential_side_effects = []
-            for var in self.side_effects._get_modified_vars():
-                if hasattr(var, "mutation_type"):
-                    mut_type = var.mutation_type
-                    # Make sure to skip codegen specific mutations
-                    if isinstance(
-                        mut_type, (AttributeMutationExisting, ValueMutationExisting)
-                    ):
-                        if isinstance(var, UserDefinedDictVariable) and isinstance(
-                            var.value, _ExportModuleSpecTrackerDict
-                        ):
-                            assert var._base_vt is not None
-                            for (
-                                k,
-                                v,
-                            ) in (
-                                var._base_vt.items.items()  # pyrefly: ignore[missing-attribute]
-                            ):
-                                # pyrefly: ignore [implicit-any]
-                                specs = {}
-                                # pyrefly: ignore[missing-attribute]
-                                for k_spec, val in v.items.items():
-                                    specs[k_spec.vt.as_python_constant()] = (
-                                        val.as_python_constant()
-                                    )
-                                assert ["in_spec", "out_spec"] == list(specs.keys())
-                                self.export_metadata.module_call_spec[
-                                    # pyrefly: ignore[missing-attribute]
-                                    k.vt.as_python_constant()
-                                ] = specs
-                        # export uses tracepoint pass to dump submodule inp/out spec
-                        # into global state, so we filter it here
-                        if not (
-                            isinstance(var, UserDefinedDictVariable)
-                            and isinstance(var.value, _ExportModuleSpecTrackerDict)
-                        ):
-                            potential_side_effects.append(var)
-            side_effect_refs = [
-                _get_source_debug_name(var.source) for var in potential_side_effects
-            ]
-
+            side_effect_refs = self.get_replayed_side_effect_source_refs(
+                populate_export_metadata=True
+            )
             if side_effect_refs:
                 if torch._dynamo.config.side_effect_replay_policy == "warn":
                     warnings.warn(
@@ -2647,9 +2669,11 @@ class OutputGraph(OutputGraphCommon):
                 )
 
             if self.package is not None:
-                gm._backend_id = name
+                gm._backend_id = name  # pyrefly: ignore[bad-argument-type]
 
+            # pyrefly: ignore[bad-argument-type]
             gm.compile_subgraph_reason = self.compile_subgraph_reason
+            # pyrefly: ignore[bad-argument-type]
             gm.meta["dynamo_flat_name_to_original_fqn"] = (
                 self.dynamo_flat_name_to_original_fqn.copy()
             )
@@ -2701,6 +2725,7 @@ class OutputGraph(OutputGraphCommon):
                 # a lot of fake_tensor ownership assumptions and runs afoul of detect_fake_mode
                 self.tracing_context.fake_mode = backend_fake_mode
 
+            gm.graph.lint()
             with self.restore_global_state():
                 compiled_fn = self.call_user_compiler(gm, self.example_inputs())
 
@@ -2916,12 +2941,15 @@ class OutputGraph(OutputGraphCommon):
             if hasattr(compiler_fn, "__name__")
             else "<unknown compiler_fn>"
         )
-        if config.inline_invoke_subgraph:
-            from torch._higher_order_ops.passes.inline_invoke_subgraph import (
-                inline_invoke_subgraph,
-            )
+        from torch._higher_order_ops.passes.inline_invoke_subgraph import (
+            inline_invoke_subgraph,
+            inline_single_use_invoke_subgraph,
+        )
 
+        if config.inline_invoke_subgraph:
             gm = inline_invoke_subgraph(gm)
+        elif config.inline_single_use_invoke_subgraph:
+            gm = inline_single_use_invoke_subgraph(gm)
 
         try:
             _step_logger()(logging.INFO, f"calling compiler function {name}")
@@ -3270,6 +3298,9 @@ class OutputGraph(OutputGraphCommon):
                 del node.meta["grapharg"]
         self.real_value_cache.clear()
         self.input_name_to_proxy.clear()
+        self._cached_replayed_side_effect_source_refs = tuple(
+            self.get_replayed_side_effect_source_refs()
+        )
         self.side_effects.clear()
         self.variable_tracker_cache.clear()
         self.mro_source_cache.clear()
@@ -3965,7 +3996,7 @@ class SubgraphTracer(fx.Tracer):
             #
             #  1. When create_graph_input for a tensor that has symbolic shapes,
             #     we look for basic symbols in its size and stride, we check if the symbol is bound
-            #     in current graph (i.e. bound_symbols), it it's not bound, we'll create a placeholder
+            #     in current graph (i.e. bound_symbols), if it's not bound, we'll create a placeholder
             #     for it then recursively check its parent, creates ph if not bound at parent until.
             #     reachting the top-level, where we require a source is attached to the proxy.
             #
@@ -4367,14 +4398,16 @@ class SubgraphTracer(fx.Tracer):
     def has_input_mutation(self) -> MutationInfo:
         input_versions_at_beginning = self._input_versions_at_beginning
         input_nodes = []
+        tensor_placeholder_indices = []
 
         input_versions_at_end = []
-        for node in self.graph.nodes:
+        for placeholder_idx, node in enumerate(self.graph.nodes):
             if node.op == "placeholder":
                 example_value = node.meta["example_value"]
                 if isinstance(example_value, torch.Tensor):
                     input_versions_at_end.append(example_value._version)
                     input_nodes.append(node)
+                    tensor_placeholder_indices.append(placeholder_idx)
             else:
                 break
 
@@ -4388,10 +4421,13 @@ class SubgraphTracer(fx.Tracer):
 
         if mutated_inputs:
             mutated_nodes = [input_nodes[i] for i in mutated_inputs]
+            mutated_input_indices = tuple(
+                tensor_placeholder_indices[i] for i in mutated_inputs
+            )
             msg = f"Input mutation detected at {mutated_nodes}"
-            return MutationInfo(True, msg)
+            return MutationInfo(True, msg, mutated_input_indices)
 
-        return MutationInfo(False, "")
+        return MutationInfo(False, "", ())
 
     def has_aliasing(self) -> AliasingInfo:
         from torch._dynamo.variables.higher_order_ops import get_tensor_storages

@@ -174,12 +174,22 @@ def impl_MATCH_KEYS(obj: Mapping[T, U], keys: tuple[T, ...]) -> tuple[U, ...] | 
 
 def impl_CONTAINS_OP_fallback(a: T, b: Iterable[T]) -> bool:
     # performs fallback "a in b"
+    # CPython: PySequence_Contains → _PySequence_IterSearch → PyObject_GetIter
+    # PyObject_GetIter itself falls back to PySequence_GetItem when tp_iter is NULL.
     if hasattr(b, "__iter__"):
-        # use __iter__ if __contains__ is not available
         for x in b:
             if x == a:
                 return True
         return False
+    if hasattr(b, "__getitem__"):
+        i = 0
+        while True:
+            try:
+                if b.__getitem__(i) == a:
+                    return True
+                i += 1
+            except IndexError:
+                return False
     raise TypeError(f"argument of type {type(b)} is not iterable")
 
 
@@ -423,25 +433,6 @@ def instantiate_user_defined_class_object(
     if issubclass(type(obj), cls):
         obj.__init__(*args, **kwargs)
     return obj
-
-
-def reduce_ex_user_defined_object(obj: T, protocol: int, /) -> tuple:  # type: ignore[type-arg]
-    """Traceable polyfill for object.__reduce_ex__ on user-defined objects.
-
-    Returns the same tuple that CPython's _common_reduce produces:
-    (copyreg.__newobj__, (cls,), obj.__dict__, None, None).
-    copy._reconstruct then calls cls.__new__(cls) and updates __dict__.
-    """
-    import copyreg
-
-    cls = type(obj)
-    return (
-        copyreg.__newobj__,  # pyrefly: ignore[missing-attribute]
-        (cls,),
-        obj.__dict__,
-        None,
-        None,
-    )
 
 
 def mutable_mapping_update(
