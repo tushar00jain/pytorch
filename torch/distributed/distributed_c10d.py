@@ -5780,7 +5780,27 @@ def new_group(
     N.B. use_local_synchronization=True can lead to deadlocks when each rank creates
     multiple overlapping process groups. To avoid that, make sure all ranks follow the
     same global creation order.
+
+    N.B. When TorchComms is enabled (``torch.distributed.config.use_torchcomms``
+    / ``TORCH_DISTRIBUTED_USE_TORCHCOMMS=1``), this function delegates to
+    :func:`split_group` so subgroup creation goes through the TorchComms path.
+    The delegation raises ``NotImplementedError`` for arguments that
+    :func:`split_group` cannot honor (e.g. ``use_local_synchronization=True``,
+    ``sort_ranks=False``, or an explicit ``device_id`` that diverges from the
+    default group's bound device).
     """
+    if _use_torchcomms_enabled():
+        return _new_group_via_split_group(
+            ranks=ranks,
+            timeout=timeout,
+            backend=backend,
+            pg_options=pg_options,
+            use_local_synchronization=use_local_synchronization,
+            group_desc=group_desc,
+            device_id=device_id,
+            sort_ranks=sort_ranks,
+        )
+
     return _new_group_with_tag(
         ranks,
         timeout,
@@ -5792,6 +5812,64 @@ def new_group(
         device_id=device_id,
         sort_ranks=sort_ranks,
     )
+
+
+def _new_group_via_split_group(
+    ranks,
+    timeout,
+    backend,
+    pg_options,
+    use_local_synchronization,
+    group_desc,
+    device_id,
+    sort_ranks,
+):
+    """Implement `new_group` semantics on top of `split_group`.
+
+    Used on the TorchComms path so subgroup creation goes through
+    :func:`split_group`. Raises ``NotImplementedError`` (or ``ValueError``
+    for inconsistent args) when the requested ``new_group`` configuration
+    cannot be expressed through ``split_group``.
+    """
+    if use_local_synchronization:
+        raise NotImplementedError(
+            "new_group cannot delegate to split_group with "
+            "use_local_synchronization=True; split_group requires all ranks "
+            "in the parent group to participate."
+        )
+    if not sort_ranks:
+        raise NotImplementedError(
+            "new_group cannot delegate to split_group with sort_ranks=False; "
+            "split_group always sorts the ranks of each subgroup."
+        )
+
+    default_pg = _get_default_group()
+    if device_id is not None:
+        bound = default_pg.bound_device_id
+        if bound is not None and device_id != bound:
+            raise ValueError(
+                f"device_id={device_id} does not match the default process "
+                f"group's bound_device_id={bound}; split_group inherits the "
+                "default group's device binding."
+            )
+
+    global_world_size = default_pg.size()
+    if ranks is None:
+        group_ranks = list(range(global_world_size))
+    else:
+        group_ranks = sorted(ranks)
+
+    split_pg = split_group(
+        parent_pg=default_pg,
+        split_ranks=[group_ranks],
+        timeout=timeout,
+        pg_options=pg_options,
+        group_desc=group_desc,
+        backend=backend,
+    )
+    if split_pg is None:
+        return GroupMember.NON_GROUP_MEMBER
+    return split_pg
 
 
 def _new_group_with_tag(
