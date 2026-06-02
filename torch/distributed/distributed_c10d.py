@@ -5561,6 +5561,11 @@ def split_group(
         parent_backend = parent_pg._get_backend(
             torch.accelerator.current_accelerator()  # pyrefly: ignore[bad-argument-type]
         )
+    elif _use_torchcomms_enabled():
+        # torchcomms supports CPU/gloo splitting; no accelerator is required.
+        parent_backend = parent_pg._get_backend(
+            torch.device("cpu")  # pyrefly: ignore[bad-argument-type]
+        )
     else:
         raise RuntimeError(
             "No backend for the parent process group or its backend does not support splitting"
@@ -5666,6 +5671,9 @@ def split_group(
         split_backend_class = split_pg._get_backend(
             torch.accelerator.current_accelerator()  # pyrefly: ignore[bad-argument-type]
         )
+    elif _use_torchcomms_enabled():
+        # torchcomms supports CPU/gloo splitting; no accelerator is required.
+        split_backend_class = split_pg._get_backend(torch.device("cpu"))
     else:
         raise RuntimeError(
             "No backend for the parent process group or its backend does not support splitting"
