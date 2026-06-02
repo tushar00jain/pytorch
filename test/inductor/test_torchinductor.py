@@ -4243,6 +4243,63 @@ class CommonTemplate:
 
         self.common(fn, (torch.randn(8, 8), torch.randn(8, 8)))
 
+    def test_softmax_reused_expensive_pointwise_cpu(self):
+        if not is_cpp_backend(self.device):
+            raise unittest.SkipTest("C++ CPU codegen regression test")
+
+        def fn(scores, table):
+            n = scores.shape[-1]
+            context_position = torch.arange(n, device=scores.device)[:, None]
+            memory_position = torch.arange(n, device=scores.device)[None, :]
+            relative_position = memory_position - context_position
+
+            num_buckets = 32
+            max_distance = 128
+            relative_buckets = (relative_position > 0).to(torch.long) * (
+                num_buckets // 2
+            )
+            relative_position = torch.abs(relative_position)
+            max_exact = num_buckets // 4
+            is_small = relative_position < max_exact
+            relative_position_if_large = max_exact + (
+                torch.log(
+                    torch.clamp(relative_position, min=max_exact).float() / max_exact
+                )
+                / math.log(max_distance / max_exact)
+                * (num_buckets // 2 - max_exact)
+            ).to(torch.long)
+            relative_position_if_large = torch.minimum(
+                relative_position_if_large,
+                torch.full_like(relative_position_if_large, num_buckets // 2 - 1),
+            )
+            relative_buckets += torch.where(
+                is_small, relative_position, relative_position_if_large
+            )
+            values = F.embedding(relative_buckets, table)
+            values = values.permute(2, 0, 1).unsqueeze(0)
+
+            scores += values
+            return torch.softmax(scores.float(), dim=-1)
+
+        scores = torch.randn(2, 4, 16, 16)
+        table = torch.randn(32, 4)
+        expected_scores = scores.clone()
+
+        actual, code = run_and_get_cpp_code(
+            torch.compile(fn, fullgraph=True), scores, table
+        )
+        expected = fn(expected_scores, table)
+
+        self.assertEqual(actual, expected)
+        self.assertEqual(scores, expected_scores)
+        log_count = code.count("std::log(") + code.count(".log()")
+        if torch._dynamo.config.assume_static_by_default:
+            self.assertEqual(log_count, 1)
+        else:
+            # Dynamic-shape clones can emit both vector and scalar tail code
+            # paths for the single realized log kernel.
+            self.assertIn(log_count, (1, 2))
+
     def test_log_softmax(self):
         def fn(a, b):
             return (F.log_softmax(a + b, -1), F.log_softmax(a, 0), F.log_softmax(b, 1))
@@ -7814,6 +7871,42 @@ class CommonTemplate:
             (torch.ones([0]),),
         )
 
+    def test_cat_empty_1d_negative_dim(self):
+        def fn(cache, new_keys):
+            return torch.cat([cache, new_keys], dim=-2)
+
+        self.common(
+            fn,
+            (
+                torch.tensor([], dtype=torch.bfloat16),
+                torch.randn(1, 8, 5, 78, dtype=torch.bfloat16),
+            ),
+        )
+
+    def test_cat_empty_1d_negative_dim_zero_output(self):
+        def fn(cache, new_keys):
+            return torch.cat([cache, new_keys], dim=-2)
+
+        self.common(
+            fn,
+            (
+                torch.tensor([], dtype=torch.bfloat16),
+                torch.randn(1, 8, 0, 78, dtype=torch.bfloat16),
+            ),
+        )
+
+        # Covers the early-return path when all inputs are skipped as 1-D empty
+        def fn_all_empty(a, b):
+            return torch.cat([a, b], dim=0)
+
+        self.common(
+            fn_all_empty,
+            (
+                torch.tensor([], dtype=torch.float32),
+                torch.tensor([], dtype=torch.float32),
+            ),
+        )
+
     def test_cat_upcasting(self):
         def fn(arg4_1, slice_7):
             cat_1 = aten.cat.default([arg4_1, slice_7], 1)
@@ -10427,6 +10520,39 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 ],
             )
 
+    def test_diagonal_scatter_backward(self):
+        def fn(x, a, offset, dim1, dim2):
+            return torch.diagonal_scatter(x, a, offset, dim1, dim2).sum()
+
+        cases = [
+            ((5, 5), (5,), 0, 0, 1),
+            ((5, 4, 5), (4, 4), 1, 0, 2),
+            ((3, 5, 5), (3, 4), 1, 1, 2),
+            ((5, 5), (4,), -1, 0, 1),
+        ]
+
+        compiled_fn = torch.compile(fn, backend="inductor", fullgraph=True)
+
+        for x_shape, y_shape, offset, dim1, dim2 in cases:
+            with self.subTest(
+                x_shape=x_shape, y_shape=y_shape, offset=offset, dim1=dim1, dim2=dim2
+            ):
+                x = torch.zeros(*x_shape, device=self.device, requires_grad=True)
+                y = torch.ones(*y_shape, device=self.device, requires_grad=True)
+
+                x_ref = x.detach().clone().requires_grad_(True)
+                y_ref = y.detach().clone().requires_grad_(True)
+
+                out_ref = fn(x_ref, y_ref, offset, dim1, dim2)
+                out_ref.backward()
+
+                out = compiled_fn(x, y, offset, dim1, dim2)
+                out.backward()
+
+                self.assertEqual(out, out_ref)
+                self.assertEqual(x.grad, x_ref.grad)
+                self.assertEqual(y.grad, y_ref.grad)
+
     @skip_if_gpu_halide  # accuracy issue
     def test_slice_scatter(self):
         def fn(x, a):
@@ -12061,9 +12187,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             self.assertEqual(fw_code.count("halide_helpers.rand"), 1)
             self.assertEqual(bw_code.count("halide_helpers.rand"), 0)
         elif self.device == GPU_TYPE and not torch._inductor.config.align_random_eager:
-            self.assertEqual(fw_code.count("triton_helpers.rand4x"), 1)
-            self.assertEqual(fw_code.count("tl.rand"), 0)
-            self.assertEqual(bw_code.count("triton_helpers.rand4x"), 0)
+            self.assertEqual(fw_code.count("tl.rand"), 1)
             self.assertEqual(bw_code.count("tl.rand"), 0)
         g2 = weight.grad.clone()
         check(r2, g2)
@@ -12114,9 +12238,7 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             # the triton signature specializes on 1 vs non-1, you might get 1
             # or 2 kernels. In newer versions of triton, there's no specialization
             # so we get only 1 kernel.
-            self.assertEqual(fw_code.count("triton_helpers.rand4x"), 2)
-            self.assertEqual(fw_code.count("tl.rand"), 0)
-            self.assertEqual(bw_code.count("triton_helpers.rand4x"), 0)
+            self.assertEqual(fw_code.count("tl.rand"), 2)
             self.assertEqual(bw_code.count("tl.rand"), 0)
             self.assertEqual(
                 torch._inductor.metrics.generated_kernel_count,
@@ -12127,52 +12249,6 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
                 torch._inductor.metrics.generated_kernel_count,
                 4,
             )
-
-    @xfail_if_mps  # Only works for triton
-    def test_randn_uses_randn4x(self):
-        if self.device != GPU_TYPE:
-            raise unittest.SkipTest("Only valid for GPU!")
-
-        @torch.compile
-        def fn():
-            return torch.randn([1024], device=self.device)
-
-        torch.manual_seed(1234)
-        result, (code,) = run_and_get_code(fn)
-        self.assertEqual(result.shape, (1024,))
-        self.assertEqual(code.count("triton_helpers.randn4x"), 1)
-        self.assertEqual(code.count("tl.randn"), 0)
-
-    @xfail_if_mps  # Only works for Triton on CUDA
-    def test_rand4x_falls_back_in_reduction(self):
-        if self.device != "cuda":
-            raise unittest.SkipTest("Only valid for CUDA!")
-
-        @torch.compile
-        def fn(x):
-            return (torch.rand_like(x) * x).sum(dim=1)
-
-        result, (code,) = run_and_get_code(fn, torch.ones([8, 32], device=self.device))
-        self.assertEqual(result.shape, (8,))
-        self.assertEqual(code.count("triton_helpers.rand4x"), 0)
-        self.assertEqual(code.count("tl.rand("), 1)
-
-    @xfail_if_mps  # Only works for Triton on CUDA
-    @config.patch(align_random_eager=True)
-    def test_align_random_eager_skips_rand4x(self):
-        if self.device != "cuda":
-            raise unittest.SkipTest("Only valid for CUDA!")
-
-        @torch.compile
-        def fn():
-            return torch.rand([1024], device=self.device)
-
-        torch.manual_seed(1234)
-        result, (code,) = run_and_get_code(fn)
-        self.assertEqual(result.shape, (1024,))
-        self.assertEqual(code.count("triton_helpers.rand4x"), 0)
-        self.assertEqual(code.count("triton_helpers.rand_eager_kernel"), 1)
-        self.assertEqual(code.count("tl.rand("), 0)
 
     @xfail_if_mps  # Only works for triton
     def test_randint_kernel_count(self):
@@ -14996,6 +15072,63 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
             # But because our custom op needs fixed layout, the assertions in the custom op will pass
             self.common(fn, (inp,), check_lowp=False)
 
+    @config.patch(implicit_fallbacks=True)
+    def test_custom_op_fixed_layout_tensor_list(self):
+        def make_strided(x):
+            return torch.empty_strided(
+                (x.shape[0], 2), (1, x.shape[0]), dtype=x.dtype, device=x.device
+            )
+
+        def make_strided_meta(x):
+            return torch.empty_strided(
+                (x.shape[0], 2), (1, x.shape[0]), dtype=x.dtype, device=x.device
+            )
+
+        define_custom_op_for_test(
+            "make_strided_fixed_layout_list",
+            make_strided,
+            make_strided_meta,
+        )
+
+        @lowering.register_lowering(
+            torch.ops.test.make_strided_fixed_layout_list.default
+        )
+        def _(x):
+            return lowering.empty_strided(
+                (x.get_size()[0], 2),
+                (2, 1),
+                dtype=x.get_dtype(),
+                device=x.get_device(),
+            )
+
+        def check_strides(xs):
+            expected_stride = (1, xs[0].shape[0])
+            if xs[0].stride() != expected_stride:
+                raise AssertionError(
+                    f"Expected stride {expected_stride}, got {xs[0].stride()}"
+                )
+            return torch.ones_like(xs[0])
+
+        def check_strides_meta(xs):
+            return torch.empty_like(xs[0])
+
+        define_custom_op_3_for_test(
+            "check_fixed_layout_list",
+            check_strides,
+            check_strides_meta,
+            tags=[torch._C.Tag.needs_fixed_stride_order],
+        )
+
+        def fn(x):
+            y = torch.ops.test.make_strided_fixed_layout_list(x)
+            return torch.ops.test.check_fixed_layout_list([y])
+
+        self.common(
+            fn,
+            (torch.randn((2, 2), device=self.device),),
+            check_lowp=False,
+        )
+
     @requires_gpu()
     @config.patch(implicit_fallbacks=True)
     @tf32_on_and_off(0.005)
@@ -16939,6 +17072,28 @@ def forward(self, arg0_1: "Sym(s77)", arg1_1: "Sym(s27)", arg2_1: "Sym(s53)", ar
         profile_output = str(p.key_averages())
         print(profile_output)
         self.assertFalse("Pageable" in profile_output)
+
+    @unittest.skipIf(
+        config.cpp_wrapper,
+        "event sync only emitted for Python wrapper",
+    )
+    @skip_if_halide
+    @requires_gpu_and_triton
+    @torch._dynamo.config.patch(capture_scalar_outputs=True)
+    def test_non_blocking_d2h_event_sync(self):
+        def f(x):
+            s = x.abs().sum().to("cpu", non_blocking=True).item()
+            return torch.clamp(x, 0.0, s)
+
+        x = torch.randn(10, device=GPU_TYPE)
+        compiled_fn = torch.compile(f, dynamic=True)
+        result, code = run_and_get_code(compiled_fn, x)
+        expected = f(x)
+        self.assertEqual(result, expected)
+        wrapper_code = code[0]
+        self.assertIn("torch.Event()", wrapper_code)
+        self.assertIn(".record()", wrapper_code)
+        self.assertIn(".synchronize()", wrapper_code)
 
     @unittest.skipIf(
         config.cpp_wrapper,
