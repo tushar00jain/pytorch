@@ -438,7 +438,17 @@ class _PipelineSchedule(ABC):
                 if torch.device(stage.device).type != "cpu"
             }
         )
-        with torch.random.fork_rng(devices=devices):
+        device_type = devices[0].type if devices else None
+        # Assert all device types are the same
+        if device_type is not None and not all(
+            device.type == device_type for device in devices
+        ):
+            device_types = {device.type for device in devices}
+            raise AssertionError(
+                "All stages must have the same device type for RNG forking. "
+                f"Found device types: {device_types}"
+            )
+        with torch.random.fork_rng(devices=devices, device_type=device_type):
             if needs_fwd:
                 next_stage_args: Any = None
                 for stage in stages:
@@ -622,6 +632,18 @@ def _batch_p2p(p2p_ops: list[dist.P2POp], desc: str | None = None) -> list[dist.
         return []
     desc_str = f"{desc}, " if desc else ""
     logger.debug("batch_p2p %s%s", desc_str, p2p_ops)
+
+    # Per-direction P2P (PipelineStage(p2p_per_direction=True)) tags forward and
+    # backward ops with different communicators. A fused batch (e.g. 1F1B's
+    # fwd_sends + bwd_recvs) then spans >1 group; issue each group's ops as their
+    # own batch so they run on separate comms/streams instead of one FIFO. When
+    # all ops share a group (the default), this is a no-op fast path.
+    op_groups = {id(p.group): p.group for p in p2p_ops}
+    if len(op_groups) > 1:
+        works: list[dist.Work] = []
+        for g in op_groups.values():
+            works += _batch_p2p([p for p in p2p_ops if p.group is g], desc=desc)
+        return works
 
     op_types = {p.op for p in p2p_ops}
     if op_types == {dist.isend}:
