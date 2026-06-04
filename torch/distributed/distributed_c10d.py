@@ -5797,7 +5797,13 @@ def new_group(
     ``sort_ranks=False``, or an explicit ``device_id`` that diverges from the
     default group's bound device).
     """
-    if _use_torchcomms_enabled():
+    # A "fake" backend has no underlying TorchComm to split. DeviceMesh creates
+    # disabled mesh dims as fake groups via
+    # ``new_group(..., use_local_synchronization=True)`` -- something split_group cannot
+    # express (it requires every parent rank to participate). Route fake
+    # backends through the normal path, which has no real communicator to create (see ``_new_group_with_tag``).
+    _is_fake_backend = backend is not None and str(backend).lower() == "fake"
+    if _use_torchcomms_enabled() and not _is_fake_backend:
         return _new_group_via_split_group(
             ranks=ranks,
             timeout=timeout,
