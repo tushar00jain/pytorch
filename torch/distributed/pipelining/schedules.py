@@ -633,6 +633,20 @@ def _batch_p2p(p2p_ops: list[dist.P2POp], desc: str | None = None) -> list[dist.
     desc_str = f"{desc}, " if desc else ""
     logger.debug("batch_p2p %s%s", desc_str, p2p_ops)
 
+    # Per-direction P2P (config.pipeline_per_direction_p2p) tags forward and
+    # backward ops with different communicators. A fused batch (e.g. 1F1B's
+    # fwd_sends + bwd_recvs) then spans >1 group; issue each group's ops as their
+    # own batch so they run on separate comms/streams instead of one FIFO. When
+    # all ops share a group (the default), this is a no-op fast path.
+    ops_by_group: dict[int, list[dist.P2POp]] = {}
+    for p in p2p_ops:
+        ops_by_group.setdefault(id(p.group), []).append(p)
+    if len(ops_by_group) > 1:
+        works: list[dist.Work] = []
+        for group_ops in ops_by_group.values():
+            works += _batch_p2p(group_ops, desc=desc)
+        return works
+
     op_types = {p.op for p in p2p_ops}
     if op_types == {dist.isend}:
         return [
