@@ -1850,6 +1850,28 @@ def init_process_group(
     if backend is None:
         backend = "undefined"
 
+    # TorchComms needs device-qualified backend strings so that split_group
+    # can create subgroups for each device type.  Auto-qualify bare backend
+    # names (e.g. "nccl" → "cpu:gloo,cuda:nccl") so callers don't have to.
+    if (
+        _use_torchcomms_enabled()
+        and device_id is not None
+        and ":" not in backend
+        and backend not in (Backend.UNDEFINED, Backend.MPI, Backend.FAKE)
+    ):
+        bare = backend.lower()
+        qualified: dict[str, str] = {}
+        for dev, be in Backend.default_device_backend_map.items():
+            if be == bare:
+                qualified[dev] = bare
+        if not qualified:
+            qualified[device_id.type] = bare
+        if "cpu" not in qualified:
+            cpu_be = Backend.default_device_backend_map.get("cpu")
+            if cpu_be:
+                qualified["cpu"] = cpu_be
+        backend = ",".join(f"{d}:{b}" for d, b in qualified.items())
+
     # Convert string into `Backend` type
     backend = Backend(backend)
 
