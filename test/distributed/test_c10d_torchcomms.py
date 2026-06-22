@@ -204,9 +204,6 @@ class TestC10dTorchCommsBasic(C10dTorchCommsTestBase):
         self.assertTrue(True)
 
     def test_new_group_delegates_to_split_group(self):
-        # Under torchcomms, `new_group` routes through `split_group`. The
-        # resulting subgroup must contain the requested ranks and be usable
-        # for collectives.
         subg_ranks = list(range(self.world_size // 2))
         ng = dist.new_group(ranks=subg_ranks)
 
@@ -219,14 +216,52 @@ class TestC10dTorchCommsBasic(C10dTorchCommsTestBase):
             self.assertIs(ng, dist.GroupMember.NON_GROUP_MEMBER)
 
     def test_new_group_via_split_group_raises_on_unsupported_args(self):
-        # `split_group` has a narrower surface than `new_group`; under
-        # torchcomms the delegation must surface that mismatch instead of
-        # silently falling back to the legacy path.
         ranks = list(range(self.world_size))
         with self.assertRaisesRegex(NotImplementedError, "use_local_synchronization"):
             dist.new_group(ranks=ranks, use_local_synchronization=True)
         with self.assertRaisesRegex(NotImplementedError, "sort_ranks"):
             dist.new_group(ranks=ranks, sort_ranks=False)
+
+    def test_new_group_backend_none_narrows_to_default_device(self):
+        ranks = list(range(self.world_size))
+        ng = dist.new_group(ranks=ranks, backend=None)
+        tensor = torch.tensor([self._rank_value], dtype=torch.float32)
+        dist.all_reduce(tensor, group=ng)
+        self.assertEqual(tensor.item(), sum(range(1, self.world_size + 1)))
+
+    def test_new_group_bare_default_backend_is_auto_qualified(self):
+        ranks = list(range(self.world_size))
+        ng = dist.new_group(ranks=ranks, backend="nccl")
+        tensor = torch.tensor([self._rank_value], dtype=torch.float32)
+        dist.all_reduce(tensor, group=ng)
+        self.assertEqual(tensor.item(), sum(range(1, self.world_size + 1)))
+
+    def test_new_group_qualified_backend_passes_through(self):
+        ranks = list(range(self.world_size))
+        ng = dist.new_group(ranks=ranks, backend="cuda:nccl")
+        tensor = torch.tensor([self._rank_value], dtype=torch.float32)
+        dist.all_reduce(tensor, group=ng)
+        self.assertEqual(tensor.item(), sum(range(1, self.world_size + 1)))
+
+    def test_new_group_with_pg_options(self):
+        ranks = list(range(self.world_size))
+        opts = dist.ProcessGroupNCCL.Options(is_high_priority_stream=True)
+        opts.config.cga_cluster_size = 2
+        opts.config.max_ctas = 16
+        ng = dist.new_group(ranks=ranks, pg_options=opts)
+        tensor = torch.tensor([self._rank_value], dtype=torch.float32)
+        dist.all_reduce(tensor, group=ng)
+        self.assertEqual(tensor.item(), sum(range(1, self.world_size + 1)))
+
+    def test_new_group_sequential_pg_options_produce_distinct_groups(self):
+        ranks = list(range(self.world_size))
+        opts_a = dist.ProcessGroupNCCL.Options(is_high_priority_stream=True)
+        opts_a.config.cga_cluster_size = 2
+        opts_b = dist.ProcessGroupNCCL.Options()
+        opts_b.config.cga_cluster_size = 4
+        g_a = dist.new_group(ranks=ranks, pg_options=opts_a)
+        g_b = dist.new_group(ranks=ranks, pg_options=opts_b)
+        self.assertNotEqual(g_a.group_name, g_b.group_name)
 
 
 devices = ["cpu", "cuda", "xpu"]

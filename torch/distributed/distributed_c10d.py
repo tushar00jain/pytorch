@@ -5930,6 +5930,43 @@ def _new_group_via_split_group(
     else:
         group_ranks = sorted(ranks)
 
+    # Auto-qualify the requested backend so it always names just the parent's
+    # default device backend (the one matching ``bound_device_id``) plus any
+    # explicitly-requested extra device entry.
+    #
+    # split_group's filter has two requirements:
+    #   (1) it must contain the parent's default device backend, and
+    #   (2) device entries it omits are not included in the new subgroup.
+    #
+    # The naive default (``backend=None``) inherits the parent's full set,
+    # which creates an extra gloo comm per subgroup on every nccl-with-gloo
+    # parent — expensive and racy. Explicitly narrowing to the default
+    # device backend gives every torchcomms caller the same single-backend
+    # subgroup they almost always want, while still letting an explicit
+    # device-qualified string (``"cpu:gloo,cuda:nccl"``) opt back into the
+    # multi-backend behavior
+    bound = default_pg.bound_device_id
+    if bound is not None and (backend is None or ":" not in str(backend)):
+        parent_backend_str, _ = _world.pg_map[default_pg]
+        parent_device_backends = _parse_backend_string(parent_backend_str)
+        default_dev = bound.type
+        default_be = parent_device_backends.get(default_dev)
+        if default_be is not None:
+            if backend is None:
+                # Inherit just the default-device backend, not all parent
+                # device backends.
+                backend = f"{default_dev}:{default_be}"
+            else:
+                bare = str(backend)
+                matched_device = next(
+                    (d for d, be in parent_device_backends.items() if be == bare),
+                    None,
+                )
+                if matched_device is not None:
+                    qualified: dict[str, str] = {matched_device: bare}
+                    qualified.setdefault(default_dev, default_be)
+                    backend = ",".join(f"{d}:{b}" for d, b in qualified.items())
+
     # torchcomms backends expect every parent rank to participate in split:
     # members pass their ranks list, non-members pass [] (NCCL_SPLIT_NOCOLOR
     # for nccl, no-op for gloo). `ProcessGroup::splitGroup` rejects empty
