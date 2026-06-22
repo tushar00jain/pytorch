@@ -1943,6 +1943,12 @@ def init_process_group(
 
     _update_default_pg(default_pg)
 
+    # When TorchComms is enabled and the PG is device-bound, the underlying
+    # NCCL comm is still created lazily. Force eager creation so that
+    # split_group (which requires the parent comm to exist) works immediately.
+    if _use_torchcomms_enabled() and device_id is not None:
+        barrier(device_ids=[device_id.index])
+
     _world.pg_group_ranks[GroupMember.WORLD] = {  # type: ignore[index]
         i: i
         for i in range(GroupMember.WORLD.size())  # type: ignore[attr-defined]
