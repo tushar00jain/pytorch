@@ -2115,18 +2115,24 @@ def _new_process_group_helper(
                 torch_device,
                 backend_str,
             )
-            # TODO: figure out pg option conversion for torchComms.
             # `persistent_store=true` tells torchcomms to reuse the c10d-side
             # `backend_prefix_store` directly instead of constructing its own
             # TCPStore via StoreManager (which would otherwise require an
             # explicit MASTER_ADDR/MASTER_PORT and conflict with the c10d
             # rendezvous store on rapid re-binds).
+            hints: dict[str, str] = {"persistent_store": "true"}
+            if backend_options is not None:
+                from torchcomms.distwrap.utils import pg_options_to_hints
+
+                extra = pg_options_to_hints(backend_options)
+                if extra:
+                    hints.update(extra)
             comm = new_comm(
                 backend_str,
                 torch_device,
                 name=group_name,
                 store=backend_prefix_store,
-                hints={"persistent_store": "true"},
+                hints=hints,
             )
             buffer_size = os.environ.get(
                 "TORCH_FR_BUFFER_SIZE",
@@ -5664,7 +5670,6 @@ def split_group(
         pg_backend = Backend(str(backend))
         backend_config = BackendConfig(pg_backend)
 
-    # TODO: figure out pg option for torchComms
     if pg_options is None and not _use_torchcomms_enabled():
         # default pg_options same as the parent process group
         # A deep copy is needed because if the option will be modified inside split
