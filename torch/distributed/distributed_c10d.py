@@ -171,6 +171,26 @@ def _use_torchcomms_enabled() -> bool:
     return _TORCHCOMM_AVAILABLE and dist_config.use_torchcomms
 
 
+def _nccl_options_to_torchcomms_hints(pg_options) -> dict:
+    """Translate ``ProcessGroupNCCL.Options`` to the ``Dict[str, str]`` form
+    TorchComms accepts via ``CommOptions.hints``.
+    """
+    if pg_options is None:
+        return {}
+    hints: dict = {}
+    try:
+        if getattr(pg_options, "is_high_priority_stream", False):
+            hints["high_priority_stream"] = "true"
+        cfg = getattr(pg_options, "config", None)
+        for k in ("cga_cluster_size", "max_ctas", "min_ctas"):
+            val = getattr(cfg, k, None)
+            if val is not None and val != -(2**31):  # NCCL_CONFIG_UNDEF_INT
+                hints[k] = str(val)
+    except AttributeError:
+        pass
+    return hints
+
+
 _pickler = pickle.Pickler
 _unpickler = pickle.Unpickler
 
@@ -2115,18 +2135,21 @@ def _new_process_group_helper(
                 torch_device,
                 backend_str,
             )
-            # TODO: figure out pg option conversion for torchComms.
             # `persistent_store=true` tells torchcomms to reuse the c10d-side
             # `backend_prefix_store` directly instead of constructing its own
             # TCPStore via StoreManager (which would otherwise require an
             # explicit MASTER_ADDR/MASTER_PORT and conflict with the c10d
             # rendezvous store on rapid re-binds).
+            torchcomms_hints = {"persistent_store": "true"}
+            torchcomms_hints.update(
+                _nccl_options_to_torchcomms_hints(backend_options)
+            )
             comm = new_comm(
                 backend_str,
                 torch_device,
                 name=group_name,
                 store=backend_prefix_store,
-                hints={"persistent_store": "true"},
+                hints=torchcomms_hints,
             )
             buffer_size = os.environ.get(
                 "TORCH_FR_BUFFER_SIZE",
@@ -5860,7 +5883,44 @@ def new_group(
             and str(backend).lower() == "fake"
             and str(backend).lower() != str(parent_backend).lower()
         )
+
         if not is_fake_subgroup:
+            # Auto-qualify the requested backend so the subgroup names just
+            # the parent's default-device backend (the one matching
+            # ``bound_device_id``) plus any explicitly-requested extra device
+            # entry. Without this, ``backend=None`` inherits the parent's
+            # full set (e.g. ``cpu:gloo,cuda:nccl``) and creates an extra
+            # gloo comm per subgroup on every nccl-with-gloo parent —
+            # expensive and racy. Applies to both the ``split_group`` and
+            # the ``_new_group_with_tag`` dispatch paths below so the
+            # bypass path taken when ``pg_options`` carries torchcomms
+            # hints doesn't regress this. Removes per-caller
+            # backend-qualifier helpers (sglang's ``_device_backend_str``,
+            # Megatron-LM's ``_torchcomms_qualified_backend``).
+            default_pg = _get_default_group()
+            bound = default_pg.bound_device_id
+            if bound is not None:
+                parent_device_backends = _parse_backend_string(parent_backend)
+                default_be = parent_device_backends.get(bound.type)
+                if default_be is not None:
+                    requested = (
+                        {bound.type: default_be}
+                        if backend is None
+                        else _parse_backend_string(str(backend))
+                    )
+                    requested.setdefault(bound.type, default_be)
+                    backend = ",".join(f"{d}:{b}" for d, b in requested.items())
+
+        # ``ProcessGroup::splitGroup`` does not consume NCCL Options, so when
+        # the caller supplies ``pg_options`` that translate to TorchComms
+        # hints (high_priority_stream / cga_cluster_size / max_ctas /
+        # min_ctas) bypass the split path and let ``_new_group_with_tag`` ->
+        # ``_new_process_group_helper`` build a fresh torchcomms comm with
+        # those hints applied.
+        has_torchcomms_hints = pg_options is not None and bool(
+            _nccl_options_to_torchcomms_hints(pg_options)
+        )
+        if not is_fake_subgroup and not has_torchcomms_hints:
             return _new_group_via_split_group(
                 ranks=ranks,
                 timeout=timeout,
