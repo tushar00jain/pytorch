@@ -6038,7 +6038,6 @@ def _new_group_via_split_group(
                 )
                 if matched_device is not None:
                     qualified: dict[str, str] = {matched_device: bare}
-                    qualified.setdefault(default_dev, default_be)
                     backend = ",".join(f"{d}:{b}" for d, b in qualified.items())
 
     # torchcomms backends expect every parent rank to participate in split:
