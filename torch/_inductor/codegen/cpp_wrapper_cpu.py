@@ -672,38 +672,24 @@ class CppWrapperCpu(PythonWrapperCodegen):
             return f"{name}_stride"
 
         def maybe_emit_replacement_aliases(sym: sympy.Symbol) -> None:
-            # Deferred runtime asserts and graph input metadata can reference
-            # either side of a backed-symbol replacement. Emit aliases so both
-            # the pre-replacement and canonical names are defined.
-            def is_backed_symbol(s: sympy.Symbol) -> bool:
-                return not symbol_is_type(s, (SymT.UNBACKED_INT, SymT.UNBACKED_FLOAT))
-
-            def decl_type(s: sympy.Symbol) -> str:
-                if s.is_integer:
-                    return "int64_t"
-                if s.is_float:
-                    return "double"
-                raise AssertionError("Unexpected symbol type")
+            # Deferred runtime asserts reference pre-replacement backed
+            # symbols (e.g. s77) that were replaced to this canonical
+            # symbol (s31) during constraint solving. Emit aliases so
+            # the asserts compile. Skip unbacked symbols — they are
+            # defined separately by the unbacked symbol codegen path.
+            from torch.utils._sympy.symbol import symbol_is_type, SymT
 
             for src, tgt in V.graph.sizevars.shape_env.replacements.items():
                 if (
                     tgt == sym
                     and isinstance(src, sympy.Symbol)
                     and src not in bound_vars
-                    and is_backed_symbol(src)
-                    and is_backed_symbol(sym)
+                    and not symbol_is_type(
+                        src, (SymT.UNBACKED_INT, SymT.UNBACKED_FLOAT)
+                    )
                 ):
-                    code.writeline(f"{decl_type(src)} {src} = {sym};")
+                    code.writeline(f"int64_t {src} = {sym};")
                     bound_vars.add(src)
-                elif (
-                    src == sym
-                    and isinstance(tgt, sympy.Symbol)
-                    and tgt not in bound_vars
-                    and is_backed_symbol(sym)
-                    and is_backed_symbol(tgt)
-                ):
-                    code.writeline(f"{decl_type(tgt)} {tgt} = {sym};")
-                    bound_vars.add(tgt)
 
         def codegen_symbol(
             sym_or_exp: sympy.Symbol | sympy.Expr,
@@ -3928,14 +3914,30 @@ if (!custom_op_wrapper) {
             }}
             """)
 
-        if len(output_args) == 1 and (output := output_args[0]) is not None:
+        if raw_outputs:
+            num_returned_outputs = 0
+            returned_output_slots = []
+            for output_arg, raw_output_arg in zip(output_args, raw_outputs):
+                if isinstance(raw_output_arg, ir.MutationOutput):
+                    continue
+                if output_arg is not None:
+                    returned_output_slots.append((num_returned_outputs, output_arg))
+                num_returned_outputs += 1
+        else:
+            num_returned_outputs = len(output_args)
+            returned_output_slots = [
+                (idx, output_arg)
+                for idx, output_arg in enumerate(output_args)
+                if output_arg is not None
+            ]
+
+        if num_returned_outputs == 1 and returned_output_slots:
             # result is a single tensor
+            _, output = returned_output_slots[0]
             lines += f"{output} = reinterpret_cast<AtenTensorHandle>(PyCapsule_GetPointer(py_{buf_name}.get(), NULL));\n"
         else:
             # result is a tuple of tensors
-            for idx, output_arg in enumerate(output_args):
-                if output_arg is None:
-                    continue
+            for idx, output_arg in returned_output_slots:
                 lines += f"{output_arg} = reinterpret_cast<AtenTensorHandle>(PyCapsule_GetPointer(PyList_GET_ITEM(py_{buf_name}.get(), {idx}), NULL));\n"
 
         if raw_outputs:

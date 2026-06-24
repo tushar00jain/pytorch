@@ -6027,17 +6027,6 @@ class TemplateBuffer(OperationBuffer):
         return tuple(walk(structured, []))
 
 
-@dataclasses.dataclass(frozen=True)
-class FlexGemmEpilogueConfig:
-    epilogue_name: str
-    epilogue_source: str
-    gemm_op: str
-    alpha: float
-    beta: float
-    tuned: bool = False
-    out_dtype: Any | None = None
-
-
 class TritonTemplateBuffer(TemplateBuffer):
     def __init__(
         self,
@@ -9736,12 +9725,7 @@ class FallbackKernel(ExternKernelAlloc):
                 out_op = lookup_manual_out_variant(kernel)
 
             if out_op is not None and len(get_out_arg_names(out_op)) == 1:
-                layout = FixedLayout(
-                    device=example_output.device,
-                    dtype=example_output.dtype,
-                    size=[*example_output.shape],
-                    stride=[*example_output.stride()],
-                )
+                layout = cls.tensor_to_layout(example_output)
                 return ExternKernelOut(  # type: ignore[return-value]
                     layout=layout,
                     inputs=list(tensor_args),

@@ -190,6 +190,8 @@ constant_fold_functions = [
     torch._C._get_cublas_allow_tf32,
     torch._C._is_any_autocast_enabled,
     torch.accelerator.is_available,
+    torch.backends.mps.is_available.__wrapped__,  # type: ignore[attr-defined]
+    torch.backends.mps.is_built,
     torch.cuda.get_device_properties,
     torch.cuda.is_available,
     torch.distributed.is_available,
@@ -205,6 +207,8 @@ constant_fold_functions = [
     torch.promote_types,
     torch._C._get_privateuse1_backend_name,
     torch.autograd._is_checkpoint_valid,
+    torch.mps.is_available,
+    torch.mtia.is_available,
     torch.xpu.get_device_properties,
     torch.xpu.is_available,
 ] + constant_fold_functions_need_guards
@@ -1720,10 +1724,17 @@ class TorchInGraphFunctionVariable(BaseTorchVariable):
             *args: VariableTracker,
             **kwargs: VariableTracker,
         ) -> VariableTracker | None:
-            # Decompose via addcmul_ so tensor weights (e.g. 0-dim tensor
-            # from tensor betas in Adam) stay in tensor arguments instead of
-            # hitting float() in the native lerp_scalar lowering.
-            if len(args) == 3 and not isinstance(args[2], ListVariable) and not kwargs:
+            # Decompose via addcmul_ only when the weight is a tensor, so
+            # tensor weights (e.g. 0-dim tensor from tensor betas in Adam) stay
+            # in tensor arguments instead of hitting float() in the native
+            # lerp_scalar lowering.  Python scalar weights can use the native
+            # foreach op directly, avoiding extra full-size weight tensors.
+            if (
+                config.enable_dynamo_decompositions
+                and len(args) == 3
+                and args[2].is_tensor()
+                and not kwargs
+            ):
                 return tx.inline_user_function_return(
                     VariableTracker.build(tx, polyfills.foreach_lerp_inplace),
                     list(args),

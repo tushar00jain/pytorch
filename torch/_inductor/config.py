@@ -359,7 +359,12 @@ batch_fusion = True
 # merge_splits_pass
 # mutate_cat_pass
 # split_cat_pass
-pre_grad_fusion_options: dict[str, dict[str, Any]] = {}
+pre_grad_fusion_options: dict[str, dict[str, Any]] = {
+    "batch_linear_lhs": {
+        "devices": ("xpu",),
+        "min_fuse_set_size": 2,
+    },
+}
 
 # Post grad fusion and options, set to empty dict to disable fusion.
 # Call `torch._inductor.fx_passes.group_batch_fusion.list_group_batch_fusions(False)` to see available fusions.
@@ -1194,6 +1199,15 @@ class _collective:
 class aten_distributed_optimizations:
     """Configuration for distributed optimization passes on ATen FX graphs."""
 
+    # Move collectives earlier and waits later in the inductor schedule
+    # to overlap communication with compute.
+    #
+    # Guarantees:
+    #   - No collective reordering (preserves NCCL stream ordering)
+    #   - No memory regression (each move verified individually)
+    #   - Predictable (no runtime estimation, no heuristics)
+    enable_simple_overlap: bool = False
+
     # Enable overlap scheduling pass
     enable_overlap_scheduling: bool = False
 
@@ -1815,6 +1829,11 @@ class triton:
     Config specific to codegen/triton.py
     """
 
+    # Select the two-pass variance algorithm for CUDA inputs whose total input
+    # working set is no larger than this fraction of the device L2 cache.
+    # Set to 0 to disable the L2-aware heuristic.
+    two_pass_variance_l2_fraction = 0.5
+
     # Use cudagraphs on output code
     cudagraphs = os.environ.get("TORCHINDUCTOR_CUDAGRAPHS") == "1"
 
@@ -2340,9 +2359,11 @@ class aot_inductor:
     # Embed generated kernel binary files into model.so
     embed_kernel_binary: bool | None = None
 
-    # Generate kernel files that support multiple archs
-    # For CUDA, this means generating fatbin files for kernels, and the fatbin files
-    # contains PTX and SASS for the current architecture.
+    # Generate kernel files that support multiple archs.
+    # For CUDA, this means generating fatbin files for kernels. The fatbin files
+    # contain PTX for the compile target architecture (config.cuda.arch, or the
+    # current GPU when unset), plus SASS for the compile target and compatible
+    # TORCH_CUDA_ARCH_LIST architectures.
     # For XPU, this means generating SPIR-V files for kernels, and the SPIR-V files
     # will be compiled to target different XPU architectures at runtime.
     emit_multi_arch_kernel: bool | None = None
