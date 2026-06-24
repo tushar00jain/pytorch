@@ -6049,8 +6049,11 @@ def _new_group_via_split_group(
     if default_pg.rank() not in group_ranks:
         group_name = _process_group_name(group_ranks, use_hashed_name=True)
         for device in default_pg._device_types:
+            be = default_pg._get_backend(device)
+            if not hasattr(be, "get_comm"):
+                continue
             # pyrefly: ignore[missing-attribute]
-            default_pg._get_backend(device).get_comm().split([], group_name)
+            be.get_comm().split([], group_name)
         return GroupMember.NON_GROUP_MEMBER
 
     return split_group(
