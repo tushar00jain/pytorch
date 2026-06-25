@@ -183,7 +183,12 @@ try:
         from torchcomms._backend_wrapper import _BackendWrapper
 
     # pyrefly: ignore [missing-import]
+    from torchcomms import is_backend_built as _torchcomms_is_backend_built
+    # pyrefly: ignore [missing-import]
     from torchcomms import new_comm
+
+    # pyrefly: ignore [missing-import]
+    from torchcomms._comms import _is_backend_registered as _torchcomms_is_backend_registered
 
     # pyrefly: ignore [missing-import]
     from torchcomms.hooks import FlightRecorderHook
@@ -196,6 +201,41 @@ except ImportError:
 def _use_torchcomms_enabled() -> bool:
     """Check if torchcomms is enabled via config."""
     return _TORCHCOMM_AVAILABLE and dist_config.use_torchcomms
+
+
+def _torchcomms_handles_backend(backend) -> bool:
+    """True if TorchComms can create a comm for *backend*.
+
+    Backends TorchComms doesn't own -- custom c10d plugins such as ``mooncake``
+    or ``ucc`` -- must fall through to the normal ProcessGroup path even when
+    TorchComms is enabled, rather than being routed through ``new_comm`` /
+    ``split_group`` (which cannot construct them).
+
+    ``backend`` may be ``None`` (inherits the parent's TorchComms-owned
+    backend), a bare name (``"nccl"``), or a device-qualified string
+    (``"cpu:gloo,cuda:nccl"``). A built-in backend reports via
+    ``is_backend_built``; a backend dynamically registered through
+    ``torchcomms.register_backend`` (e.g. a Python adapter) reports via
+    ``_is_backend_registered`` -- so registering such an adapter is enough to
+    move that backend onto the native TorchComms path with no change here.
+    """
+    if not _TORCHCOMM_AVAILABLE:
+        return False
+    if backend is None:
+        return True
+    for part in str(backend).lower().split(","):
+        part = part.strip()
+        name = part.split(":", 1)[1] if ":" in part else part
+        if not name:
+            continue
+        # "nccl-lazy" is a TorchComms variant of the built-in "nccl" backend.
+        base = "nccl" if name == "nccl-lazy" else name
+        if not (
+            _torchcomms_is_backend_registered(base)
+            or _torchcomms_is_backend_built(base)
+        ):
+            return False
+    return True
 
 
 def _pg_options_to_hints(pg_options: Any) -> dict[str, str] | None:
@@ -2215,6 +2255,7 @@ def init_process_group(
         and device_id is not None
         and ":" not in backend
         and backend not in (Backend.UNDEFINED, Backend.MPI, Backend.FAKE)
+        and _torchcomms_handles_backend(backend)
     ):
         bare = backend.lower()
         qualified: dict[str, str] = {}
@@ -2495,7 +2536,11 @@ def _new_process_group_helper(
         # a single store can be reused by multiple groups.
         backend_prefix_store = PrefixStore(f"{device}/", prefix_store)
 
-        if _use_torchcomms_enabled() and backend_str not in [Backend.FAKE]:
+        if (
+            _use_torchcomms_enabled()
+            and backend_str not in [Backend.FAKE]
+            and _torchcomms_handles_backend(backend_str)
+        ):
             torch_device = torch.device(device)
             logger.warning(
                 "Using TorchComms backend (enabled via %s) for device %s with backend %s",
@@ -6063,6 +6108,79 @@ def split_group(
     return split_pg
 
 
+def _new_lazy_process_group(ranks, timeout, group_desc=None):
+    """Build a TorchComms ``nccl-lazy``-backed device ``ProcessGroup`` over *ranks*.
+
+    ``nccl-lazy`` creates per-peer NCCL communicators for P2P send/recv (matching
+    ``ProcessGroupNCCL`` behaviour), which lets concurrent send/recv to different
+    peers overlap -- something a single eager TorchComm cannot do. ``split_group``
+    always produces an eager child, so the comm + ``ProcessGroup`` are constructed
+    manually here, mirroring ``_new_process_group_helper``'s TorchComms branch.
+
+    This is reached from :func:`new_group` on the TorchComms path when the caller
+    requests a members-only, lazily-initialized group (``use_local_synchronization=
+    True`` and no ``device_id``). The comm bootstrap is collective over *ranks*
+    only, so the caller MUST invoke this only on ranks that are members.
+
+    The comm reuses the c10d store via ``hints={"persistent_store": "true"}`` (as
+    the eager path does), so it needs no separate ``MASTER_ADDR``/``MASTER_PORT``
+    rendezvous.
+    """
+    default_pg = _get_default_group()
+    device = default_pg.bound_device_id
+    if device is None:
+        raise ValueError(
+            "new_group with use_local_synchronization=True and no device_id "
+            "requires the default process group to be device-bound; pass "
+            "device_id=... to init_process_group so a lazy per-peer group can "
+            "select its device."
+        )
+
+    group_name = _process_group_name(ranks, use_hashed_name=True)
+    gsize = len(ranks)
+    group_local_rank = ranks.index(get_rank())
+    store = PrefixStore(f"{group_name}/", _get_default_store())
+
+    comm = new_comm(
+        "nccl-lazy",
+        device,
+        store=PrefixStore("comm/", store),
+        name=group_name,
+        timeout=timeout,
+        hints={"persistent_store": "true"},
+    )
+
+    buffer_size = os.environ.get(
+        "TORCH_FR_BUFFER_SIZE",
+        os.environ.get("TORCH_NCCL_TRACE_BUFFER_SIZE", "0"),
+    )
+    FlightRecorderHook(max_entries=int(buffer_size)).register_with_comm(comm)
+
+    # Keep a reference so the comm outlives this function scope.
+    _world.comms.append(comm)
+
+    backend_class = _BackendWrapper(comm)
+    pg = ProcessGroup(PrefixStore("pg/", store), group_local_rank, gsize)
+    backend_type = ProcessGroup.BackendType.CUSTOM
+    pg._set_default_backend(backend_type)
+    pg._register_backend(device, backend_type, backend_class)
+    pg._set_group_name(group_name)
+    pg.bound_device_id = device
+
+    # Register in torch's group bookkeeping so dist.send/recv rank translation
+    # and the world-group-map checks succeed (mirrors _new_process_group_helper).
+    _register_process_group(group_name, pg)
+    _world.pg_map[pg] = ("cuda:nccl-lazy", store)
+    _world.pg_names[pg] = group_name
+    _world.pg_backend_config[pg] = "cuda:nccl-lazy"
+    _world.pg_group_ranks[pg] = {g: i for i, g in enumerate(ranks)}
+    _world.pg_to_tag[pg] = f"user:{group_name}"
+    _world.tags_to_pg.setdefault(f"user:{group_name}", []).append(pg)
+    if group_desc is not None:
+        pg._set_group_desc(group_desc)
+    return pg
+
+
 @_time_logger
 def new_group(
     ranks=None,
@@ -6155,7 +6273,7 @@ def new_group(
     ``sort_ranks=False``, or an explicit ``device_id`` that diverges from the
     default group's bound device).
     """
-    if _use_torchcomms_enabled():
+    if _use_torchcomms_enabled() and _torchcomms_handles_backend(backend):
         # split_group can only split the parent's existing communicator, so it
         # cannot produce a child whose backend differs from the parent's. A
         # "fake" subgroup of a real parent -- how DeviceMesh creates disabled /
@@ -6170,6 +6288,26 @@ def new_group(
             and str(backend).lower() == "fake"
             and str(backend).lower() != str(parent_backend).lower()
         )
+        # Members-only + lazy init (use_local_synchronization=True, no device_id)
+        # cannot be expressed through split_group, which always produces an eager
+        # child over the full parent group. Build a per-peer nccl-lazy group
+        # directly instead -- the lazy semantics map to torchcomms' "nccl-lazy"
+        # backend and the members-only semantics to its rank-subset bootstrap.
+        # Excludes the fake-subgroup case above, which DeviceMesh also creates
+        # with use_local_synchronization=True but must stay a FakeProcessGroup.
+        if (
+            use_local_synchronization
+            and device_id is None
+            and not is_fake_subgroup
+        ):
+            group_ranks = (
+                list(range(get_world_size())) if ranks is None else list(ranks)
+            )
+            if get_rank() not in group_ranks:
+                return GroupMember.NON_GROUP_MEMBER
+            if sort_ranks:
+                group_ranks = sorted(group_ranks)
+            return _new_lazy_process_group(group_ranks, timeout, group_desc=group_desc)
         if not is_fake_subgroup:
             return _new_group_via_split_group(
                 ranks=ranks,
