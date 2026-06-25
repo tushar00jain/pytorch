@@ -3176,6 +3176,14 @@ Arguments:
               py::call_guard<py::gil_scoped_release>(),
               "shutdown the backend")
           .def(
+              "split",
+              &::c10d::Backend::split,
+              py::arg("store"),
+              py::arg("ranks"),
+              py::arg("opts"),
+              py::call_guard<py::gil_scoped_release>(),
+              "split the backend into a new backend with the given ranks")
+          .def(
               "setUsePgForSymmMemRendezvous",
               &::c10d::Backend::setUsePgForSymmMemRendezvous,
               py::arg("value"))

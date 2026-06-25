@@ -6279,16 +6279,21 @@ def _new_group_via_split_group(
                     qualified: dict[str, str] = {matched_device: bare}
                     backend = ",".join(f"{d}:{b}" for d, b in qualified.items())
 
-    # torchcomms backends expect every parent rank to participate in split:
-    # members pass their ranks list, non-members pass [] (NCCL_SPLIT_NOCOLOR
-    # for nccl, no-op for gloo). `ProcessGroup::splitGroup` rejects empty
-    # ranks, so for non-members invoke each underlying TorchComm directly
-    # with [] to satisfy the collective contract without creating a PG.
+    # Non-members participate in the split collective by passing [] to
+    # each backend (NOCOLOR for nccl, no-op for gloo).
+    # ProcessGroup::splitGroup can't be used here because it passes the
+    # member ranks list to TorchComm::split, which rejects non-empty
+    # ranks lists that don't include the calling rank.
     if default_pg.rank() not in group_ranks:
         group_name = _process_group_name(group_ranks, use_hashed_name=True)
         for device in default_pg._device_types:
-            # pyrefly: ignore[missing-attribute]
-            default_pg._get_backend(device).get_comm().split([], group_name)
+            be = default_pg._get_backend(device)
+            if not be.supports_splitting:
+                continue
+            store = PrefixStore(f"{group_name}/", default_pg.get_group_store())
+            opts = be.options
+            opts.group_name = group_name
+            be.split(store, [], opts)
         return GroupMember.NON_GROUP_MEMBER
 
     return split_group(
