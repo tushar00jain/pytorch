@@ -2515,13 +2515,31 @@ def _new_process_group_helper(
                 extra = _pg_options_to_hints(backend_options)
                 if extra:
                     hints.update(extra)
-            comm = new_comm(
-                backend_str,
-                torch_device,
-                name=group_name,
-                store=backend_prefix_store,
-                hints=hints,
+            # new_comm has no rank/size params -- the TorchComms bootstrap reads
+            # them from TORCHCOMM_RANK/SIZE. Seed from this group's rank/size so
+            # non-Torchrun launchers (which TorchComms cannot auto-detect, e.g.
+            # process-spawning inference servers) work without each caller having
+            # to set these. Save/restore around the call (single-threaded here).
+            _tc_saved = (
+                os.environ.get("TORCHCOMM_RANK"),
+                os.environ.get("TORCHCOMM_SIZE"),
             )
+            os.environ["TORCHCOMM_RANK"] = str(group_rank)
+            os.environ["TORCHCOMM_SIZE"] = str(group_size)
+            try:
+                comm = new_comm(
+                    backend_str,
+                    torch_device,
+                    name=group_name,
+                    store=backend_prefix_store,
+                    hints=hints,
+                )
+            finally:
+                for _k, _v in zip(("TORCHCOMM_RANK", "TORCHCOMM_SIZE"), _tc_saved):
+                    if _v is None:
+                        os.environ.pop(_k, None)
+                    else:
+                        os.environ[_k] = _v
             buffer_size = os.environ.get(
                 "TORCH_FR_BUFFER_SIZE",
                 os.environ.get("TORCH_NCCL_TRACE_BUFFER_SIZE", "0"),
@@ -6063,6 +6081,94 @@ def split_group(
     return split_pg
 
 
+def _new_lazy_process_group(ranks, timeout, group_desc=None):
+    """Build a TorchComms ``nccl-lazy``-backed device ``ProcessGroup`` over *ranks*.
+
+    ``nccl-lazy`` creates per-peer NCCL communicators for P2P send/recv (matching
+    ``ProcessGroupNCCL`` behaviour), which lets concurrent send/recv to different
+    peers overlap -- something a single eager TorchComm cannot do. ``split_group``
+    always produces an eager child, so the comm + ``ProcessGroup`` are constructed
+    manually here, mirroring ``_new_process_group_helper``'s TorchComms branch.
+
+    This is reached from :func:`new_group` on the TorchComms path when the caller
+    requests a members-only, lazily-initialized group (``use_local_synchronization=
+    True`` and no ``device_id``). The comm bootstrap is collective over *ranks*
+    only, so the caller MUST invoke this only on ranks that are members.
+
+    The comm reuses the c10d store via ``hints={"persistent_store": "true"}`` (as
+    the eager path does), so it needs no separate ``MASTER_ADDR``/``MASTER_PORT``
+    rendezvous.
+    """
+    default_pg = _get_default_group()
+    device = default_pg.bound_device_id
+    if device is None:
+        raise ValueError(
+            "new_group with use_local_synchronization=True and no device_id "
+            "requires the default process group to be device-bound; pass "
+            "device_id=... to init_process_group so a lazy per-peer group can "
+            "select its device."
+        )
+
+    group_name = _process_group_name(ranks, use_hashed_name=True)
+    gsize = len(ranks)
+    group_local_rank = ranks.index(get_rank())
+    store = PrefixStore(f"{group_name}/", _get_default_store())
+
+    # new_comm has no rank/size parameters -- the TorchComms bootstrap reads the
+    # SUBGROUP rank/size from TORCHCOMM_RANK / TORCHCOMM_SIZE. Seed them just
+    # around new_comm (single-threaded here) so the comm knows its exact
+    # membership; this is required for single-rank groups (e.g. a degenerate
+    # pipeline-parallel group), where store rendezvous alone cannot infer size.
+    saved = (os.environ.get("TORCHCOMM_RANK"), os.environ.get("TORCHCOMM_SIZE"))
+    os.environ["TORCHCOMM_RANK"] = str(group_local_rank)
+    os.environ["TORCHCOMM_SIZE"] = str(gsize)
+    try:
+        comm = new_comm(
+            "nccl-lazy",
+            device,
+            store=PrefixStore("comm/", store),
+            name=group_name,
+            timeout=timeout,
+            hints={"persistent_store": "true"},
+        )
+    finally:
+        for _k, _v in zip(("TORCHCOMM_RANK", "TORCHCOMM_SIZE"), saved):
+            if _v is None:
+                os.environ.pop(_k, None)
+            else:
+                os.environ[_k] = _v
+
+    buffer_size = os.environ.get(
+        "TORCH_FR_BUFFER_SIZE",
+        os.environ.get("TORCH_NCCL_TRACE_BUFFER_SIZE", "0"),
+    )
+    FlightRecorderHook(max_entries=int(buffer_size)).register_with_comm(comm)
+
+    # Keep a reference so the comm outlives this function scope.
+    _world.comms.append(comm)
+
+    backend_class = _BackendWrapper(comm)
+    pg = ProcessGroup(PrefixStore("pg/", store), group_local_rank, gsize)
+    backend_type = ProcessGroup.BackendType.CUSTOM
+    pg._set_default_backend(backend_type)
+    pg._register_backend(device, backend_type, backend_class)
+    pg._set_group_name(group_name)
+    pg.bound_device_id = device
+
+    # Register in torch's group bookkeeping so dist.send/recv rank translation
+    # and the world-group-map checks succeed (mirrors _new_process_group_helper).
+    _register_process_group(group_name, pg)
+    _world.pg_map[pg] = ("cuda:nccl-lazy", store)
+    _world.pg_names[pg] = group_name
+    _world.pg_backend_config[pg] = "cuda:nccl-lazy"
+    _world.pg_group_ranks[pg] = {g: i for i, g in enumerate(ranks)}
+    _world.pg_to_tag[pg] = f"user:{group_name}"
+    _world.tags_to_pg.setdefault(f"user:{group_name}", []).append(pg)
+    if group_desc is not None:
+        pg._set_group_desc(group_desc)
+    return pg
+
+
 @_time_logger
 def new_group(
     ranks=None,
@@ -6170,6 +6276,22 @@ def new_group(
             and str(backend).lower() == "fake"
             and str(backend).lower() != str(parent_backend).lower()
         )
+        # Members-only + lazy init (use_local_synchronization=True, no device_id)
+        # cannot be expressed through split_group, which always produces an eager
+        # child over the full parent group. Build a per-peer nccl-lazy group
+        # directly instead -- the lazy semantics map to torchcomms' "nccl-lazy"
+        # backend and the members-only semantics to its rank-subset bootstrap.
+        # Excludes the fake-subgroup case above, which DeviceMesh also creates
+        # with use_local_synchronization=True but must stay a FakeProcessGroup.
+        if use_local_synchronization and device_id is None and not is_fake_subgroup:
+            group_ranks = (
+                list(range(get_world_size())) if ranks is None else list(ranks)
+            )
+            if get_rank() not in group_ranks:
+                return GroupMember.NON_GROUP_MEMBER
+            if sort_ranks:
+                group_ranks = sorted(group_ranks)
+            return _new_lazy_process_group(group_ranks, timeout, group_desc=group_desc)
         if not is_fake_subgroup:
             return _new_group_via_split_group(
                 ranks=ranks,
