@@ -369,5 +369,61 @@ instantiate_device_type_tests(
 )
 
 
+@unittest.skipIf(not _TORCHCOMM_AVAILABLE, "TorchComms is not installed")
+class TestC10dTorchCommsSplitMixedBackends(C10dTorchCommsTestBase):
+    """Verify split works when the parent PG mixes torchcomms and non-torchcomms backends.
+
+    The parent PG uses ``cuda:nccl`` (a torchcomms ``BackendWrapper``) with
+    ``cpu:fake`` (a plain ``FakeProcessGroup``).  The backend auto-qualification
+    in ``_new_group_via_split_group`` narrows the split to only the default
+    device backend, so the fake CPU backend is never asked to split.
+    """
+
+    @classmethod
+    def _init_pg(cls, rank, world_size, rdvz_file):
+        torch.distributed.config.use_torchcomms = True
+        os.environ["MASTER_ADDR"] = "localhost"
+        os.environ["MASTER_PORT"] = str(find_free_port())
+        os.environ["RANK"] = str(rank)
+        os.environ["WORLD_SIZE"] = str(world_size)
+        os.environ["TORCHCOMM_STORE_PATH"] = rdvz_file
+        os.environ["LOCAL_RANK"] = str(rank)
+
+        store = dist.FileStore(rdvz_file, world_size)
+        device_id = torch.device(f"cuda:{rank}")
+        torch.cuda.set_device(rank)
+
+        dist.init_process_group(
+            backend="cuda:nccl,cpu:fake",
+            world_size=world_size,
+            rank=rank,
+            store=store,
+            device_id=device_id,
+        )
+        cls.pg = dist.distributed_c10d._get_default_group()
+        torch.set_default_device(device_id)
+
+    @property
+    def _rank_value(self):
+        return self.rank + 1
+
+    def test_split_with_mixed_backends(self):
+        subg_ranks = list(range(self.world_size // 2))
+        ng = dist.new_group(ranks=subg_ranks)
+
+        if self.rank in subg_ranks:
+            self.assertEqual(dist.get_process_group_ranks(ng), subg_ranks)
+            tensor = torch.tensor([self._rank_value], dtype=torch.float32)
+            dist.all_reduce(tensor, group=ng)
+            self.assertEqual(tensor.item(), sum(r + 1 for r in subg_ranks))
+        else:
+            self.assertIs(ng, dist.GroupMember.NON_GROUP_MEMBER)
+
+
+instantiate_device_type_tests(
+    TestC10dTorchCommsSplitMixedBackends, globals(), only_for=["cuda"]
+)
+
+
 if __name__ == "__main__":
     run_tests()
