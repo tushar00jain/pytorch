@@ -221,10 +221,11 @@ class TestC10dTorchCommsBasic(C10dTorchCommsTestBase):
         # If we reach this point, the barrier succeeded without deadlock
         self.assertTrue(True)
 
-    def test_new_group_delegates_to_split_group(self):
-        # Under torchcomms, `new_group` routes through `split_group`. The
-        # resulting subgroup must contain the requested ranks and be usable
-        # for collectives.
+    def test_new_group_creates_subgroup(self):
+        # Under torchcomms, `new_group` builds the subgroup directly via
+        # `new_comm` (a members-only store rendezvous), not by splitting the
+        # parent. The resulting subgroup must contain the requested ranks and be
+        # usable for collectives; non-members get NON_GROUP_MEMBER.
         subg_ranks = list(range(self.world_size // 2))
         ng = dist.new_group(ranks=subg_ranks)
 
@@ -235,16 +236,6 @@ class TestC10dTorchCommsBasic(C10dTorchCommsTestBase):
             self.assertEqual(tensor.item(), sum(r + 1 for r in subg_ranks))
         else:
             self.assertIs(ng, dist.GroupMember.NON_GROUP_MEMBER)
-
-    def test_new_group_via_split_group_raises_on_unsupported_args(self):
-        # `split_group` has a narrower surface than `new_group`; under
-        # torchcomms the delegation must surface that mismatch instead of
-        # silently falling back to the legacy path.
-        ranks = list(range(self.world_size))
-        with self.assertRaisesRegex(NotImplementedError, "use_local_synchronization"):
-            dist.new_group(ranks=ranks, use_local_synchronization=True)
-        with self.assertRaisesRegex(NotImplementedError, "sort_ranks"):
-            dist.new_group(ranks=ranks, sort_ranks=False)
 
     def test_new_group_backend_none_narrows_to_default_device(self):
         ranks = list(range(self.world_size))
