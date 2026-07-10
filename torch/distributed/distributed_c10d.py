@@ -363,6 +363,11 @@ class Backend(str):  # noqa: SLOT000
     MPI = "mpi"
     XCCL = "xccl"
     FAKE = "fake"
+    # TorchComms-only per-peer variant of NCCL. Lazily creates a dedicated
+    # 2-rank communicator per send/recv peer (matching ProcessGroupNCCL), so
+    # P2P to different peers can overlap. Only meaningful when TorchComms is
+    # enabled; routed through the TorchComms branch of _new_process_group_helper.
+    NCCL_LAZY = "nccl-lazy"
 
     class _BackendPlugin(NamedTuple):
         creator_fn: Callable[..., C10DBackend | ProcessGroup | None]
@@ -370,7 +375,7 @@ class Backend(str):  # noqa: SLOT000
 
     _plugins: dict[str, _BackendPlugin] = {}
 
-    backend_list = [UNDEFINED, GLOO, NCCL, XCCL, UCC, MPI, FAKE]
+    backend_list = [UNDEFINED, GLOO, NCCL, NCCL_LAZY, XCCL, UCC, MPI, FAKE]
 
     # 3rd-party devices can register the default backend support here
     default_device_backend_map: dict[str, str] = {
@@ -383,6 +388,7 @@ class Backend(str):  # noqa: SLOT000
     backend_capability: dict[str, list[str]] = {
         GLOO: ["cpu", "cuda"],
         NCCL: ["cuda"],
+        NCCL_LAZY: ["cuda"],
         XCCL: ["xpu"],
         UCC: ["cpu", "cuda"],
         MPI: ["cpu", "cuda"],
@@ -393,6 +399,7 @@ class Backend(str):  # noqa: SLOT000
         UNDEFINED: ProcessGroup.BackendType.UNDEFINED,
         GLOO: ProcessGroup.BackendType.GLOO,
         NCCL: ProcessGroup.BackendType.NCCL,
+        NCCL_LAZY: ProcessGroup.BackendType.CUSTOM,
         XCCL: ProcessGroup.BackendType.XCCL,
         UCC: ProcessGroup.BackendType.UCC,
         MPI: ProcessGroup.BackendType.MPI,

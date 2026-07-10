@@ -2464,6 +2464,11 @@ class ProcessGroupWithDispatchedCollectivesTests(MultiProcessTestCase):
             elif backend == dist.Backend.NCCL:
                 if not dist.is_nccl_available() or not torch.cuda.is_available():
                     continue
+            elif backend == dist.Backend.NCCL_LAZY:
+                # nccl-lazy is a TorchComms-only variant of nccl; it can only be
+                # constructed on the TorchComms path, so skip it otherwise.
+                if not c10d._use_torchcomms_enabled() or not torch.cuda.is_available():
+                    continue
             elif backend == dist.Backend.GLOO:
                 if not dist.is_gloo_available():
                     continue
