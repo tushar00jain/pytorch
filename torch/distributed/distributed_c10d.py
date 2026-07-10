@@ -61,17 +61,17 @@ from .rendezvous import register_rendezvous_handler, rendezvous  # noqa: F401
 
 def _register_process_group_opaque_type() -> None:
     from torch._library.opaque_object import (
-        is_opaque_type,
+        is_custom_class,
         MemberType,
-        register_opaque_type,
+        register_custom_class,
     )
 
-    if is_opaque_type(ProcessGroup):
+    if is_custom_class(ProcessGroup):
         return
 
-    register_opaque_type(
+    register_custom_class(
         ProcessGroup,
-        typ="reference",
+        typ="symbolic",
         members={
             "size": MemberType.USE_REAL,
             "rank": MemberType.USE_REAL,
@@ -518,13 +518,16 @@ class Backend(str):  # noqa: SLOT000
                                            Default: ``False``. If set to ``True``, the backend
                                            will get an instance of ``c10d::DistributedBackendOptions``, and
                                            a process group options object as defined by the backend implementation.
-            device (str or list of str, optional): device type this backend
+            devices (str or list of str, optional): device type this backend
                             supports, e.g. "cpu", "cuda", etc. If `None`,
                             assumes CPU and the current accelerator.
 
         .. note:: This support of 3rd party backend is experimental and subject to change.
 
         """
+        if isinstance(devices, str):
+            devices = [devices]
+
         # This takes care of CUSTOM Out-of-tree backend types, update in backend_list indicates availability
         normalized_name = name.lower()
         if not hasattr(Backend, normalized_name.upper()):
@@ -547,8 +550,6 @@ class Backend(str):  # noqa: SLOT000
             device_list = ["cpu"]
             if (acc := torch.accelerator.current_accelerator()) is not None:
                 device_list.append(acc.type)
-        elif isinstance(devices, str):
-            device_list = [devices]
         else:
             device_list = devices
 
@@ -2662,20 +2663,6 @@ def _new_process_group_helper(
             if backend_result is None:
                 return GroupMember.NON_GROUP_MEMBER, None
             backend_class = backend_result
-
-        # Set sequence numbers for gloo and nccl backends.
-        if backend_str == Backend.GLOO and not _use_torchcomms_enabled():
-            if not isinstance(backend_class, ProcessGroupGloo):
-                raise AssertionError(
-                    f"Expected ProcessGroupGloo, got {type(backend_class)}"
-                )
-            backend_class._set_sequence_number_for_group()
-        elif backend_str == Backend.NCCL and not _use_torchcomms_enabled():
-            if not isinstance(backend_class, ProcessGroupNCCL):
-                raise AssertionError(
-                    f"Expected ProcessGroupNCCL, got {type(backend_class)}"
-                )
-            backend_class._set_sequence_number_for_group()
 
         # If the type is a subclass of ProcessGroup then return this process group immediately
         # TODO: This defaults to the old behavior for PythonProcessGroups which overwrites the
@@ -5979,6 +5966,9 @@ def split_group(
             in the parent pg. For example, if the parent group has 4 ranks, and split_ranks can be
             [[0, 1], [2, 3]]. Note [[0,1]] is also a valid split, in which case ranks 2, 3 would
             return a non-group member.
+            The order of ranks within each split is preserved: position in the
+            list determines the group rank in the new group. All ranks must pass
+            the same ordering.
         timeout (timedelta, optional): see `init_process_group` for details and default value.
         pg_options (ProcessGroupOptions, optional): Additional options need to be passed in during
             the construction of specific process groups. i.e.``is_high_priority_stream``
@@ -6121,7 +6111,6 @@ def split_group(
             )
         if len(split_group) != len(set(split_group)):
             raise ValueError("the split group cannot have duplicate ranks")
-        split_group = sorted(split_group)
         if parent_group_rank in split_group:
             my_group = split_group
             break
@@ -6157,8 +6146,6 @@ def split_group(
             "No backend for the parent process group or its backend does not support splitting"
         )
 
-    if not _use_torchcomms_enabled():
-        split_backend_class._set_sequence_number_for_group()
     if split_pg.group_name != group_name:
         raise AssertionError(
             f"group name should be set to {group_name} but got {split_pg.group_name}"
@@ -6381,6 +6368,7 @@ def _new_group_with_tag(
         pg_or_none = default_pg.new_group(
             ranks,
             timeout=timeout,
+            backend=backend,
             pg_options=backend_options,
             group_name=group_name,
             group_desc=group_desc,
