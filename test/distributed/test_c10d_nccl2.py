@@ -108,6 +108,35 @@ class ProcessGroupNCCL2Test(MultiProcContinuousTest):
             recv_work.wait()
             self.assertEqual(recv_t, torch.full((numel,), recv_val, device=self.device))
 
+    @requires_nccl()
+    @skip_if_lt_x_gpu(2)
+    def test_sync_barrier_blocks_host_on_stream(self) -> None:
+        # Regression test for the synchronous-barrier host block (TorchComms
+        # D109866902 "add synchronize to sync barrier").
+        # nccl2's Work.wait() is stream-order-only, so before the fix a
+        # synchronous barrier did NOT host-block the CPU thread. Stock
+        # ProcessGroupNCCL's barrier host-blocks, and downstream code (the
+        # flashinfer trtllm one-shot Lamport all_reduce) relies on that to
+        # flush an async buffer clear on the stream before the first
+        # all_reduce; a stream-order-only barrier lets the all_reduce race the
+        # clear and both ranks spin forever.
+        #
+        # Enqueue a long-running kernel on the current stream, confirm the
+        # stream is still busy, then run a synchronous barrier + wait(): it
+        # must host-block until the stream drains, so stream.query() is True.
+        # This passes on stock nccl and (pre-fix) fails on nccl2.
+        stream = torch.cuda.current_stream()
+        torch.cuda._sleep(1_000_000_000)
+        self.assertFalse(
+            stream.query(), "precondition: enqueued work should leave stream busy"
+        )
+        work = dist.barrier(async_op=True)
+        work.wait()
+        self.assertTrue(
+            stream.query(),
+            "synchronous barrier must host-block until prior stream work completes",
+        )
+
 
 if __name__ == "__main__":
     if TEST_CUDA:
