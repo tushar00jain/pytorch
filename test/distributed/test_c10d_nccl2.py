@@ -33,6 +33,67 @@ class ProcessGroupNCCL2Test(MultiProcContinuousTest):
 
     @requires_nccl()
     @skip_if_lt_x_gpu(2)
+    def test_split_group(self) -> None:
+        # Splitting is a nccl2 feature; nccl-lazy builds subgroups members-only
+        # via new_group instead. MultiProcContinuousTest turns skipTest into a
+        # class-poisoning error, so return early (all ranks agree on the backend
+        # so this stays collective-safe).
+        if self.backend_str() != "nccl2":
+            return
+        # dist.split_group drives Backend::split (ncclCommSplit under the hood).
+        # It requires the default pg to have a bound device.
+        default_pg = dist.distributed_c10d._get_default_group()
+        default_pg.bound_device_id = self.device
+        # Initialize the parent communicator before splitting.
+        dist.all_reduce(torch.ones(4, device=self.device))
+
+        # First half are members; the rest are non-members and must get the
+        # NON_GROUP_MEMBER sentinel (they still issue the no-color split so the
+        # collective stays in lockstep across the parent group).
+        members = list(range(self.world_size // 2))
+        subgroup = dist.split_group(split_ranks=[members])
+
+        if self.rank in members:
+            self.assertIsNot(subgroup, dist.GroupMember.NON_GROUP_MEMBER)
+            self.assertEqual(dist.get_process_group_ranks(subgroup), members)
+            tensor = torch.full((4,), float(self.rank + 1), device=self.device)
+            dist.all_reduce(tensor, group=subgroup)
+            expected = float(sum(r + 1 for r in members))
+            self.assertEqual(tensor, torch.full_like(tensor, expected))
+        else:
+            self.assertIs(subgroup, dist.GroupMember.NON_GROUP_MEMBER)
+
+        dist.barrier()
+
+    @requires_nccl()
+    @skip_if_lt_x_gpu(2)
+    def test_split_group_full_partition(self) -> None:
+        # Partition the whole parent group into two subgroups; every rank is a
+        # member of exactly one split and gets a live communicator.
+        if self.backend_str() != "nccl2":
+            return
+        if self.world_size % 2 != 0:
+            return
+        default_pg = dist.distributed_c10d._get_default_group()
+        default_pg.bound_device_id = self.device
+        dist.all_reduce(torch.ones(4, device=self.device))
+
+        half = self.world_size // 2
+        first = list(range(half))
+        second = list(range(half, self.world_size))
+        subgroup = dist.split_group(split_ranks=[first, second])
+        my_group = first if self.rank in first else second
+
+        self.assertIsNot(subgroup, dist.GroupMember.NON_GROUP_MEMBER)
+        self.assertEqual(dist.get_process_group_ranks(subgroup), my_group)
+        tensor = torch.full((4,), float(self.rank + 1), device=self.device)
+        dist.all_reduce(tensor, group=subgroup)
+        expected = float(sum(r + 1 for r in my_group))
+        self.assertEqual(tensor, torch.full_like(tensor, expected))
+        dist.barrier()
+
+    @requires_nccl()
+    @skip_if_lt_x_gpu(2)
     def test_watchdog_does_not_release_python_backed_tensor(self) -> None:
         class TensorSubclass(torch.Tensor):
             pass
