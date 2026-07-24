@@ -222,6 +222,21 @@ class TestC10dTorchCommsBasic(C10dTorchCommsTestBase):
         # If we reach this point, the barrier succeeded without deadlock
         self.assertTrue(True)
 
+    def test_monitored_barrier(self):
+        # monitored_barrier is gloo-only; the default PG is gloo only on the
+        # cpu variant (nccl on cuda/xpu), so run there. This drives the full
+        # dist.monitored_barrier dispatch onto BackendWrapper::monitoredBarrier
+        # (the torchcomms reimplementation of ProcessGroupGloo::monitoredBarrier).
+        if self.device_type != "cpu":
+            return
+        self.assertEqual(dist.get_backend(self.pg), dist.Backend.GLOO)
+        # All ranks check in -> the health-checking barrier returns cleanly.
+        dist.monitored_barrier(
+            group=self.pg,
+            timeout=datetime.timedelta(seconds=30),
+            wait_all_ranks=True,
+        )
+
     def test_new_group_delegates_to_split_group(self):
         # Under torchcomms, `new_group` routes through `split_group`. The
         # resulting subgroup must contain the requested ranks and be usable
@@ -356,6 +371,72 @@ class TestC10dTorchCommsInitAutoQualify(C10dTorchCommsTestBase):
         default_pg = dist.distributed_c10d._get_default_group()
         self.assertIsNotNone(default_pg.bound_device_id)
         self.assertEqual(default_pg.bound_device_id.type, "cuda")
+
+    def test_monitored_barrier_on_multi_backend_group(self):
+        # A device-bound world reports a multi-backend string from get_backend
+        # (e.g. "cpu:gloo,cuda:nccl"), which is NOT equal to Backend.GLOO. The
+        # relaxed monitored_barrier guard must still accept it under torchcomms
+        # (because it contains a gloo backend) and dispatch to the gloo CPU
+        # backend's BackendWrapper::monitoredBarrier, rather than raising
+        # "monitored_barrier is only implemented for GLOO backend".
+        backend = dist.get_backend(self.pg)
+        self.assertNotEqual(backend, dist.Backend.GLOO)
+        self.assertIn("gloo", str(backend))
+        # All ranks check in -> the barrier returns cleanly. Reaching past this
+        # call proves the guard accepted the group and the barrier ran.
+        dist.monitored_barrier(
+            group=self.pg,
+            timeout=datetime.timedelta(seconds=30),
+            wait_all_ranks=True,
+        )
+
+    def test_new_group_nccl_lazy_builds_per_peer_group(self):
+        # Passing backend="nccl-lazy" builds a per-peer, lazily-initialized
+        # group (a dedicated comm + stream per send/recv peer) usable for P2P.
+        # use_local_synchronization makes it members-only. The parent must be
+        # device-bound (it is, in this class).
+        ranks = list(range(self.world_size))
+        g = dist.new_group(
+            ranks=ranks, backend="nccl-lazy", use_local_synchronization=True
+        )
+        self.assertEqual(dist.get_process_group_ranks(g), ranks)
+        # P2P round-trip over the lazy group: 0 -> 1 -> ... -> 0
+        dev = torch.device(f"cuda:{self.rank}")
+        send_to = (self.rank + 1) % self.world_size
+        recv_from = (self.rank - 1) % self.world_size
+        if self.rank % 2 == 0:
+            dist.send(
+                torch.full((4,), float(self.rank), device=dev), dst=send_to, group=g
+            )
+            r = torch.empty(4, device=dev)
+            dist.recv(r, src=recv_from, group=g)
+        else:
+            r = torch.empty(4, device=dev)
+            dist.recv(r, src=recv_from, group=g)
+            dist.send(
+                torch.full((4,), float(self.rank), device=dev), dst=send_to, group=g
+            )
+        self.assertEqual(r[0].item(), float(recv_from))
+
+    def test_non_torchcomms_backend_falls_through_to_c10d(self):
+        # Under torchcomms, a backend TorchComms does not own (registered the way
+        # mooncake registers a custom c10d backend) must route through the normal
+        # ProcessGroup path, not new_comm. Use a gloo-backed stand-in.
+        def _creator(store, grank, gsize, timeout):
+            return dist.ProcessGroupGloo(store, grank, gsize, timeout)
+
+        name = "tc_gate_stub"
+        if name not in dist.Backend.backend_list:
+            dist.Backend.register_backend(name, _creator, devices=["cpu", "cuda"])
+
+        ranks = list(range(self.world_size))
+        g = dist.new_group(ranks=ranks, backend=name)
+        be = g._get_backend(torch.device("cpu"))
+        # The c10d creator ran (real ProcessGroupGloo), not a TorchComms wrapper.
+        self.assertNotIn("BackendWrapper", type(be).__name__)
+        t = torch.tensor([self._rank_value], dtype=torch.float32)
+        dist.all_reduce(t, group=g)
+        self.assertEqual(t.item(), sum(range(1, self.world_size + 1)))
 
 
 instantiate_device_type_tests(
