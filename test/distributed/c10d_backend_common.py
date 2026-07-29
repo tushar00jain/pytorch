@@ -66,6 +66,17 @@ C10D_BACKENDS = (
         supports_dropped_p2p_work=True,
         float8_dtypes=FLOAT8_DTYPES,
     ),
+    # nccl-lazy wraps a primary ProcessGroupNCCL (all collectives delegate to
+    # it) plus lazily-built per-peer P2P comms, so it has the same capabilities
+    # as nccl2.
+    BackendConfig(
+        "nccl-lazy",
+        "cuda",
+        supports_coalescing=True,
+        supports_cuda_graph_barrier=True,
+        supports_dropped_p2p_work=True,
+        float8_dtypes=FLOAT8_DTYPES,
+    ),
 )
 
 CUDA_BACKENDS = tuple(
