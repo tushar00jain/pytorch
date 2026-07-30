@@ -10,6 +10,7 @@ import hashlib
 import io
 import itertools
 import logging
+import operator
 import os
 import pickle
 import sys
@@ -230,6 +231,39 @@ def _is_torchcomms_backend(backend: str) -> bool:
         _torchcomms_is_backend_registered(backend)
         or _torchcomms_is_backend_built(backend)
     )
+
+
+def _torchcomms_handles_backend(backend) -> bool:
+    """True if TorchComms can create a comm for *backend*.
+
+    Backends TorchComms doesn't own -- custom c10d plugins such as ``mooncake``
+    or ``ucc`` -- must fall through to the normal ProcessGroup path even when
+    TorchComms is enabled, rather than being routed through ``new_comm`` /
+    ``split_group`` (which cannot construct them).
+
+    ``backend`` may be ``None`` (inherits the parent's TorchComms-owned
+    backend), a bare name (``"nccl"``), or a device-qualified string
+    (``"cpu:gloo,cuda:nccl"``). A built-in backend reports via
+    ``is_backend_built``; a backend dynamically registered through
+    ``torchcomms.register_backend`` (e.g. a Python adapter) reports via
+    ``_is_backend_registered`` -- so registering such an adapter is enough to
+    move that backend onto the native TorchComms path with no change here.
+    """
+    if not _TORCHCOMM_AVAILABLE:
+        return False
+    if backend is None:
+        return True
+    for part in str(backend).lower().split(","):
+        part = part.strip()
+        name = part.split(":", 1)[1] if ":" in part else part
+        if not name:
+            continue
+        if not (
+            _torchcomms_is_backend_registered(name)
+            or _torchcomms_is_backend_built(name)
+        ):
+            return False
+    return True
 
 
 def _pg_options_to_hints(pg_options: object) -> dict[str, str] | None:
@@ -2417,6 +2451,7 @@ def init_process_group(
         and device_id is not None
         and ":" not in backend
         and backend not in (Backend.UNDEFINED, Backend.MPI, Backend.FAKE)
+        and _torchcomms_handles_backend(backend)
     ):
         bare = backend.lower()
         qualified: dict[str, str] = {}
@@ -2699,7 +2734,11 @@ def _new_process_group_helper(
         # a single store can be reused by multiple groups.
         backend_prefix_store = PrefixStore(f"{device}/", prefix_store)
 
-        if _use_torchcomms_enabled() and backend_str not in [Backend.FAKE]:
+        if (
+            _use_torchcomms_enabled()
+            and backend_str not in [Backend.FAKE]
+            and _torchcomms_handles_backend(backend_str)
+        ):
             torch_device = torch.device(device)
             # Pass this rank's actual device WITH its index. A device-type-only
             # torch.device(device) makes the TorchComms bootstrap default the
@@ -6329,8 +6368,15 @@ def monitored_barrier(
         _warn_not_in_group("monitored_barrier")
         return
 
-    if get_backend(group) != Backend.GLOO:
-        raise ValueError("monitored_barrier is only implemented for GLOO backend.")
+    # monitored_barrier runs on a CPU backend (GLOO, or its torchcomms
+    # BackendWrapper equivalent). Require the group to have a CPU backend rather
+    # than matching the "gloo" name, so a device-qualified group (e.g.
+    # "cpu:gloo,cuda:nccl") is accepted for its CPU backend.
+    group_to_use = group or _get_default_group()
+    if torch.device("cpu") not in group_to_use._device_types:
+        raise ValueError(
+            "monitored_barrier requires a group with a CPU-capable backend (e.g. GLOO)."
+        )
 
     if timeout is None:
         timeout = _get_default_timeout(get_backend(group))
@@ -6345,7 +6391,6 @@ def monitored_barrier(
 
     _check_valid_timeout(timeout)
 
-    group_to_use = _get_default_group() if group is None else group
     return group_to_use.monitored_barrier(  # type:ignore[attr-defined]
         timeout, wait_all_ranks=wait_all_ranks
     )
@@ -6819,6 +6864,12 @@ def _new_group_with_tag(
         timeout = _get_default_timeout(backend)
     _check_valid_timeout(timeout)
 
+    if ranks is not None:
+        try:
+            ranks = [operator.index(rank) for rank in ranks]
+        except TypeError as error:
+            raise TypeError("ranks must be a sequence of integers") from error
+
     if use_local_synchronization:
         # MPI backend doesn't have a way for us to perform a partial sync
         if backend == Backend.MPI:
@@ -6832,8 +6883,6 @@ def _new_group_with_tag(
     if ranks is not None:
         if sort_ranks:
             ranks = sorted(ranks)
-        else:
-            ranks = list(ranks)
         if len(set(ranks)) != len(ranks):
             raise ValueError(
                 f"ranks list must not contain duplicate entries, got {ranks}"
