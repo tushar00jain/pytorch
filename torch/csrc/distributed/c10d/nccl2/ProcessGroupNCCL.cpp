@@ -17,6 +17,7 @@
 #include <c10/cuda/CUDACachingAllocator.h>
 #include <c10/util/env.h>
 #include <c10/cuda/CUDAGuard.h>
+#include <c10/util/env.h>
 #include <fmt/core.h>
 #include <nccl.h>
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
