@@ -15,6 +15,7 @@
 #include <c10/util/irange.h>
 #include <torch/csrc/cuda/CUDAPluggableAllocator.h>
 #include <torch/csrc/distributed/c10d/Types.hpp>
+#include <torch/csrc/distributed/c10d/Utils.hpp>
 
 #include <torch/csrc/distributed/c10d/nccl2/Logging.hpp>
 #include <torch/csrc/distributed/c10d/nccl2/WindowNCCL.hpp>
@@ -77,6 +78,10 @@ ProcessGroupNCCL::ProcessGroupNCCL(
     : Backend(rank, size),
       device_(at::kCUDA),
       store_(std::move(store)),
+      abort_process_on_timeout_or_error_(
+          SHOULD_TEAR_DOWN(static_cast<::c10d::ErrorHandlingMode>(getCvarInt(
+              ::c10d::TORCH_NCCL_ASYNC_ERROR_HANDLING,
+              ::c10d::SkipCleanUp)))),
       options_c10d_(options ? std::move(options) : Options::create()) {
   name_ = options_c10d_->group_name.empty() ? std::string(kBackendName)
                                             : options_c10d_->group_name;
